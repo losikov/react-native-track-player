@@ -11,7 +11,8 @@ import MediaPlayer
 import AVFoundation
 import SwiftAudioEx
 
-class Track: AudioItem, TimePitching, AssetOptionsProviding {
+/* Podverse patch https://gist.github.com/gilbertl/82e3043fa5632ef653b274a2b86f59f2 */
+class Track: AudioItem, TimePitching, AssetOptionsProviding, InitialTiming {
     let url: MediaURL
 
     @objc var title: String?
@@ -26,6 +27,9 @@ class Track: AudioItem, TimePitching, AssetOptionsProviding {
     var userAgent: String?
     let pitchAlgorithm: String?
     var isLiveStream: Bool?
+
+    /* Podverse patch https://gist.github.com/gilbertl/82e3043fa5632ef653b274a2b86f59f2 */
+    var initialTime: TimeInterval = 0.0
 
     var album: String?
     var artwork: MPMediaItemArtwork?
@@ -60,7 +64,19 @@ class Track: AudioItem, TimePitching, AssetOptionsProviding {
         self.artworkURL = MediaURL(object: dictionary["artwork"])
         self.isLiveStream = dictionary["isLiveStream"] as? Bool
 
+        /* Podverse patch https://gist.github.com/gilbertl/82e3043fa5632ef653b274a2b86f59f2 */
+        let initialTime = dictionary["iosInitialTime"] as? Double
+        if let x = initialTime {
+            self.initialTime = x
+        }
+
         self.originalObject = self.originalObject.merging(dictionary) { (_, new) in new }
+    }
+
+    /* Podverse patch https://gist.github.com/gilbertl/82e3043fa5632ef653b274a2b86f59f2 */
+    // MARK: - InitialTiming Protocol
+    func getInitialTime() -> TimeInterval {
+        return initialTime
     }
 
     // MARK: - AudioItem Protocol
