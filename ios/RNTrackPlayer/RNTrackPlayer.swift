@@ -759,7 +759,12 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate {
     public func clearNowPlayingMetadata(resolve: RCTPromiseResolveBlock, reject: RCTPromiseRejectBlock) {
         if (rejectWhenNotInitialized(reject: reject)) { return }
 
+        // Clear SwiftAudioEx controller
         player.nowPlayingInfoController.clear()
+        
+        // Also directly clear MPNowPlayingInfoCenter as backup for CarPlay and other scenarios
+        MPNowPlayingInfoCenter.default().nowPlayingInfo = nil
+        
         resolve(NSNull())
     }
 
