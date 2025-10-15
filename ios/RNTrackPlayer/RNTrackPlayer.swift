@@ -933,4 +933,34 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate {
             ]
         )
     }
+    
+    // MARK: - Sleep Timer Methods (Stub Implementations)
+    
+    @objc
+    func getSleepTimerProgress(_ resolve: @escaping RCTPromiseResolveBlock, rejecter reject: @escaping RCTPromiseRejectBlock) {
+        NSLog("RNTrackPlayer.getSleepTimerProgress called - stub implementation")
+        // Stub implementation - sleep timer not yet implemented
+        resolve(0.0) // Return 0 progress
+    }
+    
+    @objc
+    func setSleepTimer(_ time: Double, resolver resolve: @escaping RCTPromiseResolveBlock, rejecter reject: @escaping RCTPromiseRejectBlock) {
+        NSLog("RNTrackPlayer.setSleepTimer called with time: \(time) - stub implementation")
+        // Stub implementation - sleep timer not yet implemented
+        resolve(nil)
+    }
+    
+    @objc
+    func sleepWhenActiveTrackReachesEnd(_ resolve: @escaping RCTPromiseResolveBlock, rejecter reject: @escaping RCTPromiseRejectBlock) {
+        NSLog("RNTrackPlayer.sleepWhenActiveTrackReachesEnd called - stub implementation")
+        // Stub implementation - sleep timer not yet implemented
+        resolve(nil)
+    }
+    
+    @objc
+    func clearSleepTimer(_ resolve: @escaping RCTPromiseResolveBlock, rejecter reject: @escaping RCTPromiseRejectBlock) {
+        NSLog("RNTrackPlayer.clearSleepTimer called - stub implementation")
+        // Stub implementation - sleep timer not yet implemented
+        resolve(nil)
+    }
 }
