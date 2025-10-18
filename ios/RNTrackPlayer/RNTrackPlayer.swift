@@ -65,6 +65,13 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate {
             "STATE_BUFFERING": State.buffering.rawValue,
             "STATE_LOADING": State.loading.rawValue,
             "STATE_ERROR": State.error.rawValue,
+            
+            // MusicControl state constants
+            "MEDIA_STATE_PLAYING": "STATE_PLAYING",
+            "MEDIA_STATE_PAUSED": "STATE_PAUSED", 
+            "MEDIA_STATE_STOPPED": "STATE_STOPPED",
+            "MEDIA_STATE_BUFFERING": "STATE_BUFFERING",
+            "MEDIA_STATE_ERROR": "STATE_ERROR",
 
             "TRACK_PLAYBACK_ENDED_REASON_END": PlaybackEndedReason.playedUntilEnd.rawValue,
             "TRACK_PLAYBACK_ENDED_REASON_JUMPED": PlaybackEndedReason.jumpedToIndex.rawValue,
@@ -817,6 +824,10 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate {
 
     func handleAudioPlayerStateChange(state: AVPlayerWrapperState) {
         emit(event: EventType.PlaybackState, body: getPlaybackStateBodyKeyValues(state: state))
+        
+        // Update MusicControl state directly in native
+        updateMusicControlState(state: state)
+        
         if (state == .ended) {
             emit(event: EventType.PlaybackQueueEnded, body: [
                 "track": player.currentIndex,
@@ -932,6 +943,70 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate {
                 "playWhenReady": playWhenReady
             ]
         )
+    }
+    
+    // MARK: - MusicControl Integration
+    
+    private func updateMusicControlState(state: AVPlayerWrapperState) {
+        let center = MPNowPlayingInfoCenter.default()
+        
+        guard center.nowPlayingInfo != nil else {
+            return
+        }
+        
+        var details: [String: Any] = [:]
+        var mediaState: String
+        
+        // Map AVPlayerWrapperState to MusicControl state
+        switch state {
+        case .playing:
+            mediaState = "STATE_PLAYING"
+        case .paused:
+            mediaState = "STATE_PAUSED"
+        case .stopped:
+            mediaState = "STATE_STOPPED"
+        case .loading, .buffering:
+            mediaState = "STATE_BUFFERING"
+        case .failed:
+            mediaState = "STATE_ERROR"
+        case .ready:
+            mediaState = "STATE_READY"
+        case .ended:
+            mediaState = "STATE_STOPPED"
+        @unknown default:
+            mediaState = "STATE_READY"
+        }
+        
+        details["state"] = mediaState
+        
+        // Set the playback rate from the state if no speed has been defined
+        let speed: NSNumber = (mediaState == "STATE_PAUSED" || mediaState == "STATE_STOPPED") ? 0.0 : 1.0
+        details["speed"] = speed
+        
+        // Handle stopped state - disable stop command
+        if mediaState == "STATE_STOPPED" {
+            let remoteCenter = MPRemoteCommandCenter.shared()
+            remoteCenter.stopCommand.isEnabled = false
+        }
+        
+        // Update now playing info
+        var mediaDict = center.nowPlayingInfo ?? [:]
+        mediaDict.merge(details) { (_, new) in new }
+        center.nowPlayingInfo = mediaDict
+        
+        // Update playback state for iOS 11+
+        if #available(iOS 11.0, *) {
+            switch mediaState {
+            case "STATE_PLAYING":
+                center.playbackState = .playing
+            case "STATE_PAUSED":
+                center.playbackState = .paused
+            case "STATE_STOPPED":
+                center.playbackState = .stopped
+            default:
+                break
+            }
+        }
     }
     
     // MARK: - Sleep Timer Methods (Stub Implementations)
