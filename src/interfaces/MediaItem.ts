@@ -1,5 +1,5 @@
 import type { ResourceObject } from './ResourceObject';
-import { MediaItemPlayable } from '../constants';
+import { MediaItemPlayable } from '../../js/NativeRTNTrackPlayer';
 
 export interface MediaItem {
   mediaId: string;

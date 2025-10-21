@@ -1,9 +1,10 @@
 import { useState, useEffect } from 'react';
 
-import { getActiveTrack } from '../trackPlayer';
-import { Event } from '../constants';
-import type { Track } from '../interfaces/Track';
-import { useTrackPlayerEvents } from './useTrackPlayerEvents';
+import NativeTrackPlayer from '../../js/NativeRTNTrackPlayer';
+import type {
+  PlaybackActiveTrackChangedEvent,
+  Track,
+} from '../../js/NativeRTNTrackPlayer';
 
 export const useActiveTrack = (): Track | undefined => {
   const [track, setTrack] = useState<Track | undefined>();
@@ -11,8 +12,8 @@ export const useActiveTrack = (): Track | undefined => {
   // Sets the initial index (if still undefined)
   useEffect(() => {
     let unmounted = false;
-    getActiveTrack()
-      .then((initialTrack) => {
+    NativeTrackPlayer?.getActiveTrack()
+      .then((initialTrack: Track | null) => {
         if (unmounted) return;
         setTrack((track) => track ?? initialTrack ?? undefined);
       })
@@ -25,12 +26,18 @@ export const useActiveTrack = (): Track | undefined => {
     };
   }, []);
 
-  useTrackPlayerEvents(
-    [Event.PlaybackActiveTrackChanged],
-    async ({ track }) => {
-      setTrack(track ?? undefined);
-    }
-  );
+  // Listen for active track changes using New Architecture event emitter
+  useEffect(() => {
+    const subscription = NativeTrackPlayer?.onPlaybackActiveTrackChanged?.(
+      (event: PlaybackActiveTrackChangedEvent) => {
+        setTrack(event.track ?? undefined);
+      }
+    );
+
+    return () => {
+      subscription?.remove();
+    };
+  }, []);
 
   return track;
 };

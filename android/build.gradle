@@ -1,64 +1,40 @@
 buildscript {
+    ext.safeExtGet = {prop, fallback ->
+        rootProject.ext.has(prop) ? rootProject.ext.get(prop) : fallback
+    }
     repositories {
-        mavenLocal()
-        mavenCentral()
         google()
+        gradlePluginPortal()
     }
     dependencies {
-        classpath 'com.android.tools.build:gradle:4.2.2'
-        classpath "org.jetbrains.kotlin:kotlin-gradle-plugin:1.8.10"
+        classpath("com.android.tools.build:gradle:7.3.1")
+        classpath("org.jetbrains.kotlin:kotlin-gradle-plugin:1.7.22")
     }
 }
 
 apply plugin: 'com.android.library'
-apply plugin: 'kotlin-android'
+apply plugin: 'com.facebook.react'
+apply plugin: 'org.jetbrains.kotlin.android'
 
 def getExtOrIntegerDefault(name) {
     return rootProject.ext.has(name) ? rootProject.ext.get(name) : (project.properties['RNTP_' + name]).toInteger()
 }
 
 android {
-    compileSdkVersion getExtOrIntegerDefault('compileSdkVersion')
-    namespace 'com.doublesymmetry.trackplayer'
-
-    def agpVersion = com.android.Version.ANDROID_GRADLE_PLUGIN_VERSION
-    defaultConfig {
-        minSdkVersion getExtOrIntegerDefault('minSdkVersion') // RN's minimum version
-        targetSdkVersion getExtOrIntegerDefault('targetSdkVersion')
-
-        versionCode 300
-        versionName '3.0'
-
-        consumerProguardFiles 'proguard-rules.txt'
-    }
-
-    compileOptions {
-        sourceCompatibility JavaVersion.VERSION_1_8
-        targetCompatibility JavaVersion.VERSION_1_8
-    }
+    compileSdkVersion safeExtGet('compileSdkVersion', 33)
+    namespace "com.doublesymmetry.trackplayer"
 }
 
 repositories {
-    mavenLocal()
-    maven {
-        // As RN is not updated in jcenter anymore, we'll have to grab it from npm
-        // Make sure you have installed the react-native npm package before compiling
-        url '../node_modules/react-native/android'
-    }
-
     mavenCentral()
     google()
 }
 
 dependencies {
+    implementation 'com.facebook.react:react-native'
+    
+    // Keep existing dependencies
     implementation 'com.github.lovegaoshi:KotlinAudio:v2.0.0-aa23'
-    // used when building against local maven
-//    implementation "com.github.doublesymmetry:kotlin-audio:2.1.0"
-
-    //noinspection GradleDynamicVersion
-    implementation "com.facebook.react:react-native:+"
-
-    // Make sure we're using androidx
     implementation "androidx.core:core-ktx:1.9.0"
     implementation "androidx.localbroadcastmanager:localbroadcastmanager:1.1.0"
     implementation "androidx.lifecycle:lifecycle-process:2.5.1"

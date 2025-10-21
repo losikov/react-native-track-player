@@ -34,9 +34,7 @@ import com.doublesymmetry.trackplayer.module.MusicEvents
 import com.doublesymmetry.trackplayer.module.MusicEvents.Companion.METADATA_PAYLOAD_KEY
 import com.doublesymmetry.trackplayer.utils.BundleUtils
 import com.doublesymmetry.trackplayer.utils.BundleUtils.setRating
-import com.facebook.react.bridge.Arguments
 import com.facebook.react.jstasks.HeadlessJsTaskConfig
-import com.facebook.react.modules.core.DeviceEventManagerModule
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.flow
 import timber.log.Timber
@@ -44,6 +42,36 @@ import java.util.concurrent.TimeUnit
 import kotlin.system.exitProcess
 import com.doublesymmetry.trackplayer.R as TrackPlayerR
 import com.google.android.exoplayer2.ui.R as ExoPlayerR
+
+/**
+ * Interface for listening to MusicService events
+ * This allows TurboModule to receive events without using old DeviceEventEmitter
+ * Matches the EventEmitters defined in js/NativeRTNTrackPlayer.ts
+ */
+interface MusicServiceEventListener {
+    // Playback events
+    fun onPlaybackState(state: String, data: Bundle)
+    fun onPlaybackProgressUpdated(data: Bundle)
+    fun onPlaybackActiveTrackChanged(data: Bundle)
+    fun onPlaybackQueueEnded(data: Bundle)
+    fun onPlaybackError(error: String, data: Bundle)
+    fun onPlaybackPlayWhenReadyChanged(data: Bundle)
+    
+    // Remote control events
+    fun onRemotePlay()
+    fun onRemotePause()
+    fun onRemoteStop()
+    fun onRemoteNext()
+    fun onRemotePrevious()
+    fun onRemoteSeek(data: Bundle)
+    fun onRemoteJumpForward(data: Bundle)
+    fun onRemoteJumpBackward(data: Bundle)
+    fun onRemoteBookmark()
+    fun onRemotePlayId(data: Bundle)
+    fun onRemoteBrowse(data: Bundle)
+    fun onRemotePlayFromSearch(data: Bundle)
+    fun onRemoteSkip(data: Bundle)
+}
 
 @MainThread
 class MusicService : HeadlessJsMediaService() {
@@ -55,6 +83,9 @@ class MusicService : HeadlessJsMediaService() {
     var mediaTreeStyle: List<Int> = listOf(
         MediaConstants.DESCRIPTION_EXTRAS_VALUE_CONTENT_STYLE_LIST_ITEM,
         MediaConstants.DESCRIPTION_EXTRAS_VALUE_CONTENT_STYLE_LIST_ITEM)
+    
+    // Direct reference to TrackPlayerModule for New Architecture events
+    var trackPlayerModule: MusicServiceEventListener? = null
 
     @ExperimentalCoroutinesApi
     override fun onCreate() {
@@ -114,10 +145,10 @@ class MusicService : HeadlessJsMediaService() {
             result: Result<List<MediaItem>>
     ) {
         Timber.tag("GVA-RNTP").d("RNTP received loadChildren req: %s", parentMediaId)
-
-        emit(MusicEvents.BUTTON_BROWSE, Bundle().apply {
+        
+        trackPlayerModule?.onRemoteBrowse(Bundle().apply {
             putString("mediaId", parentMediaId)
-        });
+        })
         result.sendResult(mediaTree[parentMediaId])
     }
 
@@ -161,7 +192,8 @@ class MusicService : HeadlessJsMediaService() {
     private var compactCapabilities: List<Capability> = emptyList()
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        startTask(getTaskConfig(intent))
+        // TurboModule: Only start headless task if config is provided (null for New Architecture)
+        getTaskConfig(intent)?.let { startTask(it) }
         startAndStopEmptyNotificationToAvoidANR()
         return START_STICKY
     }
@@ -225,26 +257,25 @@ class MusicService : HeadlessJsMediaService() {
         val mediaSessionCallback = object: AAMediaSessionCallBack {
             override fun handlePlayFromMediaId(mediaId: String?, extras: Bundle?) {
                 Timber.tag("GVA-RNTP").d("RNTP received req to play from mediaID: %s", mediaId)
-                val emitBundle = extras ?: Bundle()
-                emit(MusicEvents.BUTTON_PLAY_FROM_ID, emitBundle.apply {
+                trackPlayerModule?.onRemotePlayId((extras ?: Bundle()).apply {
                     putString("id", mediaId)
                 })
             }
 
             override fun handlePlayFromSearch(query: String?, extras: Bundle?) {
                 Timber.tag("GVA-RNTP").d("RNTP received req to play from query: %s", query)
-                val emitBundle = extras ?: Bundle()
-                emit(MusicEvents.BUTTON_PLAY_FROM_SEARCH, emitBundle.apply {
-                    putString("query", query)
-                })
+                val searchBundle = Bundle().apply {
+                    putString("query", query ?: "")
+                }
+                trackPlayerModule?.onRemotePlayFromSearch(searchBundle)
             }
 
             override fun handleSkipToQueueItem(id: Long) {
                 Timber.tag("GVA-RNTP").d("RNTP received req to play from queue index: %d", id)
-                val emitBundle = Bundle()
-                emit(MusicEvents.BUTTON_SKIP, emitBundle.apply {
+                val skipBundle = Bundle().apply {
                     putInt("index", id.toInt())
-                })
+                }
+                trackPlayerModule?.onRemoteSkip(skipBundle)
             }
         }
         player = QueuedAudioPlayer(this@MusicService, playerConfig, bufferConfig, cacheConfig, mediaSessionCallback)
@@ -256,13 +287,18 @@ class MusicService : HeadlessJsMediaService() {
 
     @MainThread
     fun updateOptions(options: Bundle) {
+        Timber.d("🎵 MusicService.updateOptions: START")
         latestOptions = options
+        Timber.d("🎵 MusicService.updateOptions: getting androidOptions bundle")
         val androidOptions = options.getBundle(ANDROID_OPTIONS_KEY)
 
+        Timber.d("🎵 MusicService.updateOptions: setting appKilledPlaybackBehavior")
         appKilledPlaybackBehavior = AppKilledPlaybackBehavior::string.find(androidOptions?.getString(APP_KILLED_PLAYBACK_BEHAVIOR_KEY)) ?: AppKilledPlaybackBehavior.CONTINUE_PLAYBACK
 
+        Timber.d("🎵 MusicService.updateOptions: setting stopForegroundGracePeriod")
         BundleUtils.getIntOrNull(androidOptions, STOP_FOREGROUND_GRACE_PERIOD_KEY)?.let { stopForegroundGracePeriod = it }
 
+        Timber.d("🎵 MusicService.updateOptions: handling deprecated flag")
         // TODO: This handles a deprecated flag. Should be removed soon.
         options.getBoolean(STOPPING_APP_PAUSES_PLAYBACK_KEY).let {
             stoppingAppPausesPlayback = options.getBoolean(STOPPING_APP_PAUSES_PLAYBACK_KEY)
@@ -271,16 +307,21 @@ class MusicService : HeadlessJsMediaService() {
             }
         }
 
+        Timber.d("🎵 MusicService.updateOptions: setting ratingType")
         ratingType = BundleUtils.getInt(options, "ratingType", RatingCompat.RATING_NONE)
 
+        Timber.d("🎵 MusicService.updateOptions: setting alwaysPauseOnInterruption")
         player.playerOptions.alwaysPauseOnInterruption = androidOptions?.getBoolean(PAUSE_ON_INTERRUPTION_KEY) ?: false
 
-        capabilities = options.getIntegerArrayList("capabilities")?.map { Capability.values()[it] } ?: emptyList()
-        notificationCapabilities = options.getIntegerArrayList("notificationCapabilities")?.map { Capability.values()[it] } ?: emptyList()
-        compactCapabilities = options.getIntegerArrayList("compactCapabilities")?.map { Capability.values()[it] } ?: emptyList()
+        Timber.d("🎵 MusicService.updateOptions: setting capabilities")
+        capabilities = parseCapabilities(options.getStringArrayList("capabilities"))
+        notificationCapabilities = parseCapabilities(options.getStringArrayList("notificationCapabilities"))
+        compactCapabilities = parseCapabilities(options.getStringArrayList("compactCapabilities"))
 
+        Timber.d("🎵 MusicService.updateOptions: checking notificationCapabilities")
         if (notificationCapabilities.isEmpty()) notificationCapabilities = capabilities
 
+        Timber.d("🎵 MusicService.updateOptions: creating buttonsList")
         val buttonsList = notificationCapabilities.mapNotNull {
             when (it) {
                 Capability.PLAY, Capability.PAUSE -> {
@@ -315,6 +356,7 @@ class MusicService : HeadlessJsMediaService() {
             }
         }
 
+        Timber.d("🎵 MusicService.updateOptions: creating openAppIntent")
         val openAppIntent = packageManager.getLaunchIntentForPackage(packageName)?.apply {
             flags = Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP
             // Add the Uri data so apps can identify that it was a notification click
@@ -322,21 +364,28 @@ class MusicService : HeadlessJsMediaService() {
             action = Intent.ACTION_VIEW
         }
 
+        Timber.d("🎵 MusicService.updateOptions: creating notificationConfig")
         val accentColor = BundleUtils.getIntOrNull(options, "color")
         val smallIcon = BundleUtils.getIconOrNull(this, options, "icon")
         val pendingIntent = PendingIntent.getActivity(this, 0, openAppIntent, getPendingIntentFlags())
         val notificationConfig = NotificationConfig(buttonsList, accentColor, smallIcon, pendingIntent)
 
+        Timber.d("🎵 MusicService.updateOptions: creating notification")
         player.notificationManager.createNotification(notificationConfig)
 
+        Timber.d("🎵 MusicService.updateOptions: setting up progress update events")
         // setup progress update events if configured
         progressUpdateJob?.cancel()
         val updateInterval = BundleUtils.getDoubleOrNull(options, PROGRESS_UPDATE_EVENT_INTERVAL_KEY)
         if (updateInterval != null && updateInterval > 0) {
             progressUpdateJob = scope.launch {
-                progressUpdateEventFlow(updateInterval).collect { emit(MusicEvents.PLAYBACK_PROGRESS_UPDATED, it) }
+                progressUpdateEventFlow(updateInterval).collect { 
+                    Timber.d("🎵 MusicService calling trackPlayerModule.onPlaybackProgressUpdated")
+                    trackPlayerModule?.onPlaybackProgressUpdated(it) 
+                }
             }
         }
+        Timber.d("🎵 MusicService.updateOptions: COMPLETED")
     }
 
     @MainThread
@@ -538,36 +587,28 @@ class MusicService : HeadlessJsMediaService() {
         previousIndex: Int?,
         oldPosition: Double
     ) {
-        val a = Bundle()
-        a.putDouble(POSITION_KEY, oldPosition)
-        if (index != null) {
-            a.putInt(NEXT_TRACK_KEY, index)
-        }
-
-        if (previousIndex != null) {
-            a.putInt(TRACK_KEY, previousIndex)
-        }
-
-        emit(MusicEvents.PLAYBACK_TRACK_CHANGED, a)
-
-        val b = Bundle()
-        b.putDouble("lastPosition", oldPosition)
+        // Only emit the modern playback-active-track-changed event
+        // The legacy playback-track-changed event is NOT in the TurboModule spec
+        val bundle = Bundle()
+        bundle.putDouble("lastPosition", oldPosition)
         if (tracks.isNotEmpty()) {
-            b.putInt("index", player.currentIndex)
-            b.putBundle("track", tracks[player.currentIndex].originalItem)
+            bundle.putInt("index", player.currentIndex)
+            bundle.putBundle("track", tracks[player.currentIndex].originalItem)
             if (previousIndex != null) {
-                b.putInt("lastIndex", previousIndex)
-                b.putBundle("lastTrack", tracks[previousIndex].originalItem)
+                bundle.putInt("lastIndex", previousIndex)
+                bundle.putBundle("lastTrack", tracks[previousIndex].originalItem)
             }
         }
-        emit(MusicEvents.PLAYBACK_ACTIVE_TRACK_CHANGED, b)
+        Timber.d("🎵 MusicService calling trackPlayerModule.onPlaybackActiveTrackChanged")
+        trackPlayerModule?.onPlaybackActiveTrackChanged(bundle)
     }
 
     private fun emitQueueEndedEvent() {
         val bundle = Bundle()
         bundle.putInt(TRACK_KEY, player.currentIndex)
         bundle.putDouble(POSITION_KEY, player.position.toSeconds())
-        emit(MusicEvents.PLAYBACK_QUEUE_ENDED, bundle)
+        Timber.d("🎵 MusicService calling trackPlayerModule.onPlaybackQueueEnded")
+        trackPlayerModule?.onPlaybackQueueEnded(bundle)
     }
 
     @Suppress("DEPRECATION")
@@ -618,10 +659,10 @@ class MusicService : HeadlessJsMediaService() {
                         "ForegroundServiceStartNotAllowedException: App tried to start a foreground Service when it was not allowed to do so.",
                         error
                     )
-                    emit(MusicEvents.PLAYER_ERROR, Bundle().apply {
+                    trackPlayerModule?.onPlaybackError(error.message ?: "unknown", Bundle().apply {
                         putString("message", error.message)
                         putString("code", "android-foreground-service-start-not-allowed")
-                    });
+                    })
                 }
             }
         }
@@ -696,7 +737,11 @@ class MusicService : HeadlessJsMediaService() {
     private fun observeEvents() {
         scope.launch {
             event.stateChange.collect {
-                emit(MusicEvents.PLAYBACK_STATE, getPlayerStateBundle(it))
+                Timber.d("🎵 Android TrackPlayer state change: ${it} -> ${it.asLibState.state}")
+                val stateBundle = getPlayerStateBundle(it)
+                val state = stateBundle.getString("state") ?: ""
+                Timber.d("🎵 MusicService calling trackPlayerModule.onPlaybackState: $state")
+                trackPlayerModule?.onPlaybackState(state, stateBundle)
 
                 if (it == AudioPlayerState.ENDED && player.nextItem == null) {
                     emitQueueEndedEvent()
@@ -718,11 +763,7 @@ class MusicService : HeadlessJsMediaService() {
 
         scope.launch {
             event.onAudioFocusChanged.collect {
-                Bundle().apply {
-                    putBoolean(IS_FOCUS_LOSS_PERMANENT_KEY, it.isFocusLostPermanently)
-                    putBoolean(IS_PAUSED_KEY, it.isPaused)
-                    emit(MusicEvents.BUTTON_DUCK, this)
-                }
+                // BUTTON_DUCK is not in TurboModule spec - skipping
             }
         }
 
@@ -730,35 +771,29 @@ class MusicService : HeadlessJsMediaService() {
             event.onPlayerActionTriggeredExternally.collect {
                 when (it) {
                     is MediaSessionCallback.RATING -> {
-                        Bundle().apply {
-                            setRating(this, "rating", it.rating)
-                            emit(MusicEvents.BUTTON_SET_RATING, this)
-                        }
+                        // BUTTON_SET_RATING is not in TurboModule spec - skipping
                     }
                     is MediaSessionCallback.SEEK -> {
-                        Bundle().apply {
+                        trackPlayerModule?.onRemoteSeek(Bundle().apply {
                             putDouble("position", it.positionMs.toSeconds())
-                            emit(MusicEvents.BUTTON_SEEK_TO, this)
-                        }
+                        })
                     }
-                    MediaSessionCallback.PLAY -> emit(MusicEvents.BUTTON_PLAY)
-                    MediaSessionCallback.PAUSE -> emit(MusicEvents.BUTTON_PAUSE)
-                    MediaSessionCallback.NEXT -> emit(MusicEvents.BUTTON_SKIP_NEXT)
-                    MediaSessionCallback.PREVIOUS -> emit(MusicEvents.BUTTON_SKIP_PREVIOUS)
-                    MediaSessionCallback.STOP -> emit(MusicEvents.BUTTON_STOP)
+                    MediaSessionCallback.PLAY -> trackPlayerModule?.onRemotePlay()
+                    MediaSessionCallback.PAUSE -> trackPlayerModule?.onRemotePause()
+                    MediaSessionCallback.NEXT -> trackPlayerModule?.onRemoteNext()
+                    MediaSessionCallback.PREVIOUS -> trackPlayerModule?.onRemotePrevious()
+                    MediaSessionCallback.STOP -> trackPlayerModule?.onRemoteStop()
                     MediaSessionCallback.FORWARD -> {
-                        Bundle().apply {
+                        trackPlayerModule?.onRemoteJumpForward(Bundle().apply {
                             val interval = latestOptions?.getDouble(FORWARD_JUMP_INTERVAL_KEY, DEFAULT_JUMP_INTERVAL) ?: DEFAULT_JUMP_INTERVAL
                             putInt("interval", interval.toInt())
-                            emit(MusicEvents.BUTTON_JUMP_FORWARD, this)
-                        }
+                        })
                     }
                     MediaSessionCallback.REWIND -> {
-                        Bundle().apply {
+                        trackPlayerModule?.onRemoteJumpBackward(Bundle().apply {
                             val interval = latestOptions?.getDouble(BACKWARD_JUMP_INTERVAL_KEY, DEFAULT_JUMP_INTERVAL) ?: DEFAULT_JUMP_INTERVAL
                             putInt("interval", interval.toInt())
-                            emit(MusicEvents.BUTTON_JUMP_BACKWARD, this)
-                        }
+                        })
                     }
                 }
             }
@@ -766,55 +801,32 @@ class MusicService : HeadlessJsMediaService() {
 
         scope.launch {
             event.onTimedMetadata.collect {
-                val data = MetadataAdapter.fromMetadata(it)
-                val bundle = Bundle().apply {
-                    putParcelableArrayList(METADATA_PAYLOAD_KEY, ArrayList(data))
-                }
-                emit(MusicEvents.METADATA_TIMED_RECEIVED, bundle)
-
-                // TODO: Handle the different types of metadata and publish to new events
-                val metadata = PlaybackMetadata.fromId3Metadata(it)
-                    ?: PlaybackMetadata.fromIcy(it)
-                    ?: PlaybackMetadata.fromVorbisComment(it)
-                    ?: PlaybackMetadata.fromQuickTime(it)
-
-                if (metadata != null) {
-                    Bundle().apply {
-                        putString("source", metadata.source)
-                        putString("title", metadata.title)
-                        putString("url", metadata.url)
-                        putString("artist", metadata.artist)
-                        putString("album", metadata.album)
-                        putString("date", metadata.date)
-                        putString("genre", metadata.genre)
-                        emit(MusicEvents.PLAYBACK_METADATA, this)
-                    }
-                }
+                // METADATA_TIMED_RECEIVED and PLAYBACK_METADATA are not in TurboModule spec - skipping
             }
         }
 
         scope.launch {
             event.onCommonMetadata.collect {
-                val data = MetadataAdapter.fromMediaMetadata(it)
-                val bundle = Bundle().apply {
-                    putBundle(METADATA_PAYLOAD_KEY, data)
-                }
-                emit(MusicEvents.METADATA_COMMON_RECEIVED, bundle)
+                // METADATA_COMMON_RECEIVED is not in TurboModule spec - skipping
             }
         }
 
         scope.launch {
             event.playWhenReadyChange.collect {
-                Bundle().apply {
+                val bundle = Bundle().apply {
                     putBoolean("playWhenReady", it.playWhenReady)
-                    emit(MusicEvents.PLAYBACK_PLAY_WHEN_READY_CHANGED, this)
                 }
+                Timber.d("🎵 MusicService calling trackPlayerModule.onPlaybackPlayWhenReadyChanged")
+                trackPlayerModule?.onPlaybackPlayWhenReadyChanged(bundle)
             }
         }
 
         scope.launch {
             event.playbackError.collect {
-                emit(MusicEvents.PLAYBACK_ERROR, getPlaybackErrorBundle())
+                val errorBundle = getPlaybackErrorBundle()
+                val errorMessage = errorBundle.getString("message") ?: ""
+                Timber.d("🎵 MusicService calling trackPlayerModule.onPlaybackError: $errorMessage")
+                trackPlayerModule?.onPlaybackError(errorMessage, errorBundle)
             }
         }
     }
@@ -831,25 +843,11 @@ class MusicService : HeadlessJsMediaService() {
         return bundle
     }
 
-    @MainThread
-    private fun emit(event: String, data: Bundle? = null) {
-        reactNativeHost.reactInstanceManager.currentReactContext
-            ?.getJSModule(DeviceEventManagerModule.RCTDeviceEventEmitter::class.java)
-            ?.emit(event, data?.let { Arguments.fromBundle(it) })
-    }
 
-    @MainThread
-    private fun emitList(event: String, data: List<Bundle> = emptyList()) {
-        val payload = Arguments.createArray()
-        data.forEach { payload.pushMap(Arguments.fromBundle(it)) }
-
-        reactNativeHost.reactInstanceManager.currentReactContext
-            ?.getJSModule(DeviceEventManagerModule.RCTDeviceEventEmitter::class.java)
-            ?.emit(event, payload)
-    }
-
-    override fun getTaskConfig(intent: Intent?): HeadlessJsTaskConfig {
-        return HeadlessJsTaskConfig(TASK_KEY, Arguments.createMap(), 0, true)
+    override fun getTaskConfig(intent: Intent?): HeadlessJsTaskConfig? {
+        // TurboModule: Don't use headless tasks with New Architecture
+        // Remote control events are handled via direct TurboModule callbacks
+        return null
     }
 
     @MainThread
@@ -947,5 +945,28 @@ class MusicService : HeadlessJsMediaService() {
 
         const val DEFAULT_JUMP_INTERVAL = 15.0
         const val DEFAULT_STOP_FOREGROUND_GRACE_PERIOD = 5
+    }
+
+    private fun parseCapabilities(capabilityStrings: ArrayList<String>?): List<Capability> {
+        return capabilityStrings?.mapNotNull { capString ->
+            when (capString) {
+                "play" -> Capability.PLAY
+                "playFromId" -> Capability.PLAY_FROM_ID
+                "playFromSearch" -> Capability.PLAY_FROM_SEARCH
+                "pause" -> Capability.PAUSE
+                "stop" -> Capability.STOP
+                "seekTo" -> Capability.SEEK_TO
+                "skip" -> Capability.SKIP
+                "next" -> Capability.SKIP_TO_NEXT
+                "previous" -> Capability.SKIP_TO_PREVIOUS
+                "jumpForward" -> Capability.JUMP_FORWARD
+                "jumpBackward" -> Capability.JUMP_BACKWARD
+                "setRating" -> Capability.SET_RATING
+                "like" -> Capability.LIKE
+                "dislike" -> Capability.DISLIKE
+                "bookmark" -> Capability.BOOKMARK
+                else -> null
+            }
+        } ?: emptyList()
     }
 }

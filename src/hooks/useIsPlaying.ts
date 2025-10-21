@@ -1,5 +1,4 @@
-import * as TrackPlayer from '../trackPlayer';
-import { State } from '../constants';
+import NativeTrackPlayer, { State } from '../../js/NativeRTNTrackPlayer';
 import { usePlayWhenReady } from './usePlayWhenReady';
 import { usePlaybackState } from './usePlaybackState';
 
@@ -12,7 +11,7 @@ import { usePlaybackState } from './usePlaybackState';
  *   undefined if this isn't yet known.
  */
 export function useIsPlaying() {
-  const state = usePlaybackState().state;
+  const state = usePlaybackState();
   const playWhenReady = usePlayWhenReady();
 
   return determineIsPlaying(playWhenReady, state);
@@ -48,9 +47,9 @@ function determineIsPlaying(playWhenReady?: boolean, state?: State) {
  *   undefined if this isn't yet known.
  */
 export async function isPlaying() {
-  const [playbackState, playWhenReady] = await Promise.all([
-    TrackPlayer.getPlaybackState(),
-    TrackPlayer.getPlayWhenReady(),
+  const [state, playWhenReady] = await Promise.all([
+    NativeTrackPlayer?.getState(),
+    NativeTrackPlayer?.getPlayWhenReady(),
   ]);
-  return determineIsPlaying(playWhenReady, playbackState.state);
+  return determineIsPlaying(playWhenReady, state);
 }

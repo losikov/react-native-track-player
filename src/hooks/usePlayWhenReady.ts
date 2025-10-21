@@ -1,35 +1,42 @@
 import { useState, useEffect } from 'react';
 
-import { getPlayWhenReady, addEventListener } from '../trackPlayer';
-import { Event } from '../constants';
+import NativeTrackPlayer from '../../js/NativeRTNTrackPlayer';
 
+/**
+ * Get current playWhenReady state and subsequent updates.
+ *
+ * Uses the New Architecture event emitter pattern to receive state updates.
+ */
 export const usePlayWhenReady = () => {
   const [playWhenReady, setPlayWhenReady] = useState<boolean | undefined>(
     undefined
   );
+
   useEffect(() => {
     let mounted = true;
 
-    getPlayWhenReady()
-      .then((initialState) => {
+    // Get initial state
+    NativeTrackPlayer?.getPlayWhenReady()
+      .then((initialState: boolean) => {
         if (!mounted) return;
-        // Only set the state if it wasn't already set by the Event.PlaybackPlayWhenReadyChanged listener below:
-        setPlayWhenReady((state) => state ?? initialState);
+        setPlayWhenReady(initialState);
       })
       .catch(() => {
-        /** getState only throw while you haven't yet setup, ignore failure. */
+        /** getPlayWhenReady only throw while you haven't yet setup, ignore failure. */
       });
 
-    const sub = addEventListener(
-      Event.PlaybackPlayWhenReadyChanged,
-      (event) => {
-        setPlayWhenReady(event.playWhenReady);
+    // Subscribe to playWhenReady changes using New Architecture event emitter
+    const subscription = NativeTrackPlayer?.onPlaybackPlayWhenReadyChanged?.(
+      (event: { playWhenReady: boolean }) => {
+        if (mounted) {
+          setPlayWhenReady(event.playWhenReady);
+        }
       }
     );
 
     return () => {
       mounted = false;
-      sub.remove();
+      subscription?.remove();
     };
   }, []);
 
