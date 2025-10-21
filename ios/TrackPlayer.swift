@@ -1,17 +1,17 @@
 //
-//  RNTrackPlayer.swift
+//  RTNTrackPlayerSwift.swift
 //  RNTrackPlayer
 //
-//  Created by David Chavez on 13.08.17.
-//  Copyright © 2017 David Chavez. All rights reserved.
+//  Created for TurboModules implementation
 //
 
 import Foundation
 import MediaPlayer
 import SwiftAudioEx
 
-@objc(RNTrackPlayer)
-public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate {
+
+@objc
+public class TrackPlayer: NSObject, AudioSessionControllerDelegate {
 
     // MARK: - Attributes
 
@@ -22,16 +22,19 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate {
     private var shouldResumePlaybackAfterInterruptionEnds: Bool = false
     private var forwardJumpInterval: NSNumber? = nil;
     private var backwardJumpInterval: NSNumber? = nil;
+    private var interruptionStartTime: Int64? = nil
     private var sessionCategory: AVAudioSession.Category = .playback
     private var sessionCategoryMode: AVAudioSession.Mode = .default
     private var sessionCategoryPolicy: AVAudioSession.RouteSharingPolicy = .default
     private var sessionCategoryOptions: AVAudioSession.CategoryOptions = []
+    
+    // Event emitter for TurboModule events
+    public weak var eventEmitter: RTNTrackPlayerEventEmitter?
 
     // MARK: - Lifecycle Methods
 
     public override init() {
         super.init()
-        EventEmitter.shared.register(eventEmitter: self)
         audioSessionController.delegate = self
         player.playWhenReady = false;
         player.event.receiveChapterMetadata.addListener(self, handleAudioPlayerChapterMetadataReceived)
@@ -43,6 +46,11 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate {
         player.event.secondElapse.addListener(self, handleAudioPlayerSecondElapse)
         player.event.playWhenReadyChange.addListener(self, handlePlayWhenReadyChange)
     }
+    
+    @objc
+    public func setEventEmitter(_ eventEmitter: RTNTrackPlayerEventEmitter) {
+        self.eventEmitter = eventEmitter
+    }
 
     deinit {
         reset(resolve: { _ in }, reject: { _, _, _  in })
@@ -50,12 +58,12 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate {
 
     // MARK: - RCTEventEmitter
 
-    override public static func requiresMainQueueSetup() -> Bool {
+    public static func requiresMainQueueSetup() -> Bool {
         return true;
     }
 
     @objc(constantsToExport)
-    override public func constantsToExport() -> [AnyHashable: Any] {
+    public func constantsToExport() -> [AnyHashable: Any] {
         return [
             "STATE_NONE": State.none.rawValue,
             "STATE_READY": State.ready.rawValue,
@@ -68,7 +76,7 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate {
             
             // MusicControl state constants
             "MEDIA_STATE_PLAYING": "STATE_PLAYING",
-            "MEDIA_STATE_PAUSED": "STATE_PAUSED", 
+            "MEDIA_STATE_PAUSED": "STATE_PAUSED",
             "MEDIA_STATE_STOPPED": "STATE_STOPPED",
             "MEDIA_STATE_BUFFERING": "STATE_BUFFERING",
             "MEDIA_STATE_ERROR": "STATE_ERROR",
@@ -105,40 +113,25 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate {
         ]
     }
 
-    @objc(supportedEvents)
-    override public func supportedEvents() -> [String] {
-        return EventType.allRawValues()
-    }
+    // Note: TurboModules don't use supportedEvents() - events are handled differently
+    // The old RCTEventEmitter.supportedEvents() is not needed for TurboModules
 
-    private func emit(event: EventType, body: Any? = nil) {
-        EventEmitter.shared.emit(event: event, body: body)
-    }
 
     // MARK: - AudioSessionControllerDelegate
 
     public func handleInterruption(type: InterruptionType) {
         switch type {
         case .began:
-            // Interruption began, take appropriate actions (save state, update user interface)
-            emit(event: EventType.RemoteDuck, body: [
-                "paused": true
+            // Interruption began - emit simple begin event
+            eventEmitter?.emitRemoteDuck([
+                "reason": "began"
             ])
+            
         case let .ended(shouldResume):
-            if shouldResume {
-                if (shouldResumePlaybackAfterInterruptionEnds) {
-                    player.play()
-                }
-                // Interruption Ended - playback should resume
-                emit(event: EventType.RemoteDuck, body: [
-                    "paused": false
-                ])
-            } else {
-                // Interruption Ended - playback should NOT resume
-                emit(event: EventType.RemoteDuck, body: [
-                    "paused": true,
-                    "permanent": true
-                ])
-            }
+            // Interruption ended - emit simple end event
+            eventEmitter?.emitRemoteDuck([
+                "reason": "ended"
+            ])
         }
     }
 
@@ -197,7 +190,7 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate {
         // setup event listeners
         player.remoteCommandController.handleChangePlaybackPositionCommand = { [weak self] event in
             if let event = event as? MPChangePlaybackPositionCommandEvent {
-                self?.emit(event: EventType.RemoteSeek, body: ["position": event.positionTime])
+                self?.eventEmitter?.emitRemoteSeek(["position": event.positionTime])
                 return MPRemoteCommandHandlerStatus.success
             }
 
@@ -205,29 +198,29 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate {
         }
 
         player.remoteCommandController.handleNextTrackCommand = { [weak self] _ in
-            self?.emit(event: EventType.RemoteNext)
+            self?.eventEmitter?.emitRemoteNext()
             return MPRemoteCommandHandlerStatus.success
         }
 
         player.remoteCommandController.handlePauseCommand = { [weak self] _ in
-            self?.emit(event: EventType.RemotePause)
+            self?.eventEmitter?.emitRemotePause()
             return MPRemoteCommandHandlerStatus.success
         }
 
         player.remoteCommandController.handlePlayCommand = { [weak self] _ in
-            self?.emit(event: EventType.RemotePlay)
+            self?.eventEmitter?.emitRemotePlay()
             return MPRemoteCommandHandlerStatus.success
         }
 
         player.remoteCommandController.handlePreviousTrackCommand = { [weak self] _ in
-            self?.emit(event: EventType.RemotePrevious)
+            self?.eventEmitter?.emitRemotePrevious()
             return MPRemoteCommandHandlerStatus.success
         }
 
         player.remoteCommandController.handleSkipBackwardCommand = { [weak self] event in
             if let command = event.command as? MPSkipIntervalCommand,
                let interval = command.preferredIntervals.first {
-                self?.emit(event: EventType.RemoteJumpBackward, body: ["interval": interval])
+                self?.eventEmitter?.emitRemoteJumpBackward(["interval": interval])
                 return MPRemoteCommandHandlerStatus.success
             }
 
@@ -237,7 +230,7 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate {
         player.remoteCommandController.handleSkipForwardCommand = { [weak self] event in
             if let command = event.command as? MPSkipIntervalCommand,
                let interval = command.preferredIntervals.first {
-                self?.emit(event: EventType.RemoteJumpForward, body: ["interval": interval])
+                self?.eventEmitter?.emitRemoteJumpForward(["interval": interval])
                 return MPRemoteCommandHandlerStatus.success
             }
 
@@ -245,31 +238,32 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate {
         }
 
         player.remoteCommandController.handleStopCommand = { [weak self] _ in
-            self?.emit(event: EventType.RemoteStop)
+            self?.eventEmitter?.emitRemoteStop()
             return MPRemoteCommandHandlerStatus.success
         }
 
         player.remoteCommandController.handleTogglePlayPauseCommand = { [weak self] _ in
-            self?.emit(event: self?.player.playerState == .paused
-                ? EventType.RemotePlay
-                : EventType.RemotePause
-            )
+            if self?.player.playerState == .paused {
+                self?.eventEmitter?.emitRemotePlay()
+            } else {
+                self?.eventEmitter?.emitRemotePause()
+            }
 
             return MPRemoteCommandHandlerStatus.success
         }
 
         player.remoteCommandController.handleLikeCommand = { [weak self] _ in
-            self?.emit(event: EventType.RemoteLike)
+            // Note: Like/Dislike are not in TurboModule spec, so we skip them
             return MPRemoteCommandHandlerStatus.success
         }
 
         player.remoteCommandController.handleDislikeCommand = { [weak self] _ in
-            self?.emit(event: EventType.RemoteDislike)
+            // Note: Like/Dislike are not in TurboModule spec, so we skip them
             return MPRemoteCommandHandlerStatus.success
         }
 
         player.remoteCommandController.handleBookmarkCommand = { [weak self] _ in
-            self?.emit(event: EventType.RemoteBookmark)
+            self?.eventEmitter?.emitRemoteBookmark()
             return MPRemoteCommandHandlerStatus.success
         }
 
@@ -823,13 +817,13 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate {
     // MARK: - QueuedAudioPlayer Event Handlers
 
     func handleAudioPlayerStateChange(state: AVPlayerWrapperState) {
-        emit(event: EventType.PlaybackState, body: getPlaybackStateBodyKeyValues(state: state))
+        eventEmitter?.emitPlaybackState(getPlaybackStateBodyKeyValues(state: state))
         
         // Update MusicControl state directly in native
         updateMusicControlState(state: state)
         
         if (state == .ended) {
-            emit(event: EventType.PlaybackQueueEnded, body: [
+            eventEmitter?.emitPlaybackQueueEnded([
                 "track": player.currentIndex,
                 "position": player.currentTime,
             ] as [String : Any])
@@ -837,28 +831,19 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate {
     }
     
     func handleAudioPlayerCommonMetadataReceived(metadata: [AVMetadataItem]) {
-        let commonMetadata = MetadataAdapter.convertToCommonMetadata(metadata: metadata, skipRaw: true)
-        emit(event: EventType.MetadataCommonReceived, body: ["metadata": commonMetadata])
+        // Note: Metadata events are not in TurboModule spec, so we skip them
     }
     
     func handleAudioPlayerChapterMetadataReceived(metadata: [AVTimedMetadataGroup]) {
-        let metadataItems = MetadataAdapter.convertToGroupedMetadata(metadataGroups: metadata);
-        emit(event: EventType.MetadataChapterReceived, body:  ["metadata": metadataItems])
+        // Note: Metadata events are not in TurboModule spec, so we skip them
     }
 
     func handleAudioPlayerTimedMetadataReceived(metadata: [AVTimedMetadataGroup]) {
-        let metadataItems = MetadataAdapter.convertToGroupedMetadata(metadataGroups: metadata);
-        emit(event: EventType.MetadataTimedReceived, body: ["metadata": metadataItems])
-        
-        // SwiftAudioEx was updated to return the array of timed metadata
-        // Until we have support for that in RNTP, we take the first item to keep existing behaviour.
-        let metadata = metadata.first?.items ?? []
-        let metadataItem = MetadataAdapter.legacyConversion(metadata: metadata)
-        emit(event: EventType.PlaybackMetadataReceived, body: metadataItem)
+        // Note: Metadata events are not in TurboModule spec, so we skip them
     }
 
     func handleAudioPlayerFailed(error: Error?) {
-        emit(event: EventType.PlaybackError, body: ["error": error?.localizedDescription])
+        eventEmitter?.emitPlaybackError(["error": error?.localizedDescription])
     }
 
     func handleAudioPlayerCurrentItemChange(
@@ -904,7 +889,7 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate {
         if let track = (item as? Track)?.toObject() {
             a["track"] = track
         }
-        emit(event: EventType.PlaybackActiveTrackChanged, body: a)
+        eventEmitter?.emitPlaybackActiveTrackChanged(a)
 
         // deprecated:
         var b: Dictionary<String, Any> = ["position": lastPosition ?? 0]
@@ -914,7 +899,7 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate {
         if let index = index {
             b["nextTrack"] = index
         }
-        emit(event: EventType.PlaybackTrackChanged, body: b)
+        // Note: PlaybackTrackChanged is not in TurboModule spec, so we skip it
     }
 
     func handleAudioPlayerSecondElapse(seconds: Double) {
@@ -924,25 +909,19 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate {
         // _after_ a manipulation to the queu causing no currentItem to exist (see reset)
         // in which case we shouldn't emit anything or we'll get an exception.
         if !shouldEmitProgressEvent || player.currentItem == nil { return }
-        emit(
-            event: EventType.PlaybackProgressUpdated,
-            body: [
-                "position": player.currentTime,
-                "duration": player.duration,
-                "buffered": player.bufferedPosition,
-                "track": player.currentIndex,
-            ]
-        )
+        eventEmitter?.emitPlaybackProgressUpdated([
+            "position": player.currentTime,
+            "duration": player.duration,
+            "buffered": player.bufferedPosition,
+            "track": player.currentIndex,
+        ])
     }
 
     func handlePlayWhenReadyChange(playWhenReady: Bool) {
         configureAudioSession();
-        emit(
-            event: EventType.PlaybackPlayWhenReadyChanged,
-            body: [
-                "playWhenReady": playWhenReady
-            ]
-        )
+        eventEmitter?.emitPlaybackPlay(whenReadyChanged: [
+            "playWhenReady": playWhenReady
+        ])
     }
     
     // MARK: - MusicControl Integration

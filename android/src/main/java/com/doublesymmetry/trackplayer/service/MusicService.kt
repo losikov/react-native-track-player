@@ -5,6 +5,7 @@ import android.app.*
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
+import android.media.AudioManager
 import android.net.Uri
 import android.os.Binder
 import android.os.Build
@@ -71,10 +72,13 @@ interface MusicServiceEventListener {
     fun onRemoteBrowse(data: Bundle)
     fun onRemotePlayFromSearch(data: Bundle)
     fun onRemoteSkip(data: Bundle)
+    
+    // Audio interruption events
+    fun onRemoteDuck(data: Bundle)
 }
 
 @MainThread
-class MusicService : HeadlessJsMediaService() {
+class MusicService : HeadlessJsMediaService(), AudioManager.OnAudioFocusChangeListener {
     private lateinit var player: QueuedAudioPlayer
     private val binder = MusicBinder()
     private val scope = MainScope()
@@ -86,11 +90,16 @@ class MusicService : HeadlessJsMediaService() {
     
     // Direct reference to TrackPlayerModule for New Architecture events
     var trackPlayerModule: MusicServiceEventListener? = null
+    
+    // Audio focus handling
+    private var audioManager: AudioManager? = null
+    private var interruptionStartTime: Long? = null
 
     @ExperimentalCoroutinesApi
     override fun onCreate() {
         Timber.tag("GVA-RNTP").d("RNTP musicservice created.")
         super.onCreate()
+        audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
     }
 
     /**
@@ -241,7 +250,7 @@ class MusicService : HeadlessJsMediaService() {
         val cacheConfig = CacheConfig(playerOptions?.getDouble(MAX_CACHE_SIZE_KEY)?.toLong())
         val playerConfig = PlayerConfig(
             interceptPlayerActionsTriggeredExternally = true,
-            handleAudioBecomingNoisy = true,
+            handleAudioBecomingNoisy = playerOptions?.getBoolean(AUTO_HANDLE_ROUTE_CHANGES) ?: true,
             handleAudioFocus = playerOptions?.getBoolean(AUTO_HANDLE_INTERRUPTIONS) ?: false,
             audioContentType = when(playerOptions?.getString(ANDROID_AUDIO_CONTENT_TYPE)) {
                 "music" -> AudioContentType.MUSIC
@@ -939,7 +948,9 @@ class MusicService : HeadlessJsMediaService() {
         const val PAUSE_ON_INTERRUPTION_KEY = "alwaysPauseOnInterruption"
         const val AUTO_UPDATE_METADATA = "autoUpdateMetadata"
         const val AUTO_HANDLE_INTERRUPTIONS = "autoHandleInterruptions"
+        const val AUTO_HANDLE_ROUTE_CHANGES = "autoHandleRouteChanges"
         const val ANDROID_AUDIO_CONTENT_TYPE = "androidAudioContentType"
+        const val ANDROID_AUDIO_FOCUS_GAIN_TYPE = "androidAudioFocusGainType"
         const val IS_FOCUS_LOSS_PERMANENT_KEY = "permanent"
         const val IS_PAUSED_KEY = "paused"
 
@@ -968,5 +979,44 @@ class MusicService : HeadlessJsMediaService() {
                 else -> null
             }
         } ?: emptyList()
+    }
+    
+    // MARK: - Audio Focus Handling
+    
+    override fun onAudioFocusChange(focusChange: Int) {
+        when (focusChange) {
+            AudioManager.AUDIOFOCUS_LOSS,
+            AudioManager.AUDIOFOCUS_LOSS_TRANSIENT,
+            AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK -> {
+                // Any loss of audio focus - emit simple begin event
+                if (interruptionStartTime == null) {
+                    interruptionStartTime = System.currentTimeMillis()
+                    trackPlayerModule?.onRemoteDuck(Bundle().apply {
+                        putString("reason", "began")
+                    })
+                }
+            }
+            AudioManager.AUDIOFOCUS_GAIN -> {
+                // Gained audio focus - emit simple end event
+                if (interruptionStartTime != null) {
+                    trackPlayerModule?.onRemoteDuck(Bundle().apply {
+                        putString("reason", "ended")
+                    })
+                    interruptionStartTime = null
+                }
+            }
+        }
+    }
+    
+    fun requestAudioFocus(): Boolean {
+        return audioManager?.requestAudioFocus(
+            this,
+            AudioManager.STREAM_MUSIC,
+            AudioManager.AUDIOFOCUS_GAIN
+        ) == AudioManager.AUDIOFOCUS_REQUEST_GRANTED
+    }
+    
+    fun abandonAudioFocus() {
+        audioManager?.abandonAudioFocus(this)
     }
 }

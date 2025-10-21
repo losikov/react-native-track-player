@@ -1158,4 +1158,11 @@ class TrackPlayerModule(
             emitOnRemoteSkip(Arguments.fromBundle(data))
         }
     }
+    
+    override fun onRemoteDuck(data: Bundle) {
+        Timber.d("🎵 TrackPlayerModule.onRemoteDuck")
+        scope.launch {
+            emitOnRemoteDuck(Arguments.fromBundle(data))
+        }
+    }
 }

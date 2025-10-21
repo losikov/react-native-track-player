@@ -192,6 +192,7 @@ export enum RepeatMode {
   Queue = 2,
 }
 
+
 // Capability constants (string values - match Capability.ts)
 export const Capability = {
   Play: 'play',
@@ -258,6 +259,8 @@ export interface PlayerOptions {
   waitForBuffer?: boolean;
   autoUpdateMetadata?: boolean;
   autoHandleInterruptions?: boolean;
+  autoHandleRouteChanges?: boolean;
+  androidAudioFocusGainType?: 'gain' | 'gainTransient' | 'gainTransientMayDuck';
 }
 
 export interface Spec extends TurboModule {
@@ -370,8 +373,9 @@ export interface Spec extends TurboModule {
    * Examples: "Play Big Book", "Play Daily Reflections", "Play some music"
    */
   readonly onRemotePlayFromSearch: EventEmitter<{ query: string, extras: Object }>;
+  
+  // Audio ducking events for smart interruption handling
+  readonly onRemoteDuck: EventEmitter<{ reason: 'began' | 'ended' }>;
 }
 
 export default TurboModuleRegistry.get<Spec>("RTNTrackPlayer") as Spec;
-
-// Re-export types for external use

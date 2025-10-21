@@ -13,10 +13,16 @@ Pod::Spec.new do |s|
   s.platform = :ios, "11.0"
 
   s.source = { :git => package["repository"]["url"], :tag => "v#{s.version}" }
-  s.source_files = "ios/**/*.{h,m,swift}"
+  s.source_files = "ios/**/*.{h,m,mm,swift}"
 
-  s.swift_version = "4.2"
+  # s.swift_version = "4.2"
 
-  s.dependency "React-Core"
+  s.pod_target_xcconfig = {
+    "DEFINES_MODULE" => "YES",
+    "OTHER_CPLUSPLUSFLAGS" => "-DRCT_NEW_ARCH_ENABLED=1"
+  }
+
   s.dependency "SwiftAudioEx", "1.1.0"
+
+  install_modules_dependencies(s)
 end
