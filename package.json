@@ -29,6 +29,7 @@
   "files": [
     "src",
     "lib/**/*",
+    "js",
     "ios/**/*",
     "android/src/**/*",
     "android/build.gradle",
