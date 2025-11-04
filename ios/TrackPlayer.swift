@@ -760,11 +760,8 @@ public class TrackPlayer: NSObject, AudioSessionControllerDelegate {
     public func clearNowPlayingMetadata(resolve: RCTPromiseResolveBlock, reject: RCTPromiseRejectBlock) {
         if (rejectWhenNotInitialized(reject: reject)) { return }
 
-        // Clear SwiftAudioEx controller
+        // Clear SwiftAudioEx controller - it handles MPNowPlayingInfoCenter internally
         player.nowPlayingInfoController.clear()
-        
-        // Also directly clear MPNowPlayingInfoCenter as backup for CarPlay and other scenarios
-        MPNowPlayingInfoCenter.default().nowPlayingInfo = nil
         
         resolve(NSNull())
     }
@@ -819,8 +816,22 @@ public class TrackPlayer: NSObject, AudioSessionControllerDelegate {
     func handleAudioPlayerStateChange(state: AVPlayerWrapperState) {
         eventEmitter?.emitPlaybackState(getPlaybackStateBodyKeyValues(state: state))
         
-        // Update MusicControl state directly in native
-        updateMusicControlState(state: state)
+        // Set playbackState for macOS/CarPlay simulator compatibility
+        // SwiftAudioEx automatically handles playbackRate and elapsedPlaybackTime updates
+        switch state {
+        case .playing:
+            MPNowPlayingInfoCenter.default().playbackState = .playing
+        case .paused:
+            MPNowPlayingInfoCenter.default().playbackState = .paused
+        case .stopped, .ended:
+            MPNowPlayingInfoCenter.default().playbackState = .stopped
+        case .loading, .buffering, .ready, .idle, .failed:
+            // For transitional states, set to unknown
+            // Buffering/loading during playback might be better as .playing, but .unknown is safer
+            MPNowPlayingInfoCenter.default().playbackState = .unknown
+        @unknown default:
+            MPNowPlayingInfoCenter.default().playbackState = .unknown
+        }
         
         if (state == .ended) {
             eventEmitter?.emitPlaybackQueueEnded([
@@ -909,6 +920,11 @@ public class TrackPlayer: NSObject, AudioSessionControllerDelegate {
         // _after_ a manipulation to the queu causing no currentItem to exist (see reset)
         // in which case we shouldn't emit anything or we'll get an exception.
         if !shouldEmitProgressEvent || player.currentItem == nil { return }
+        
+        // SwiftAudioEx automatically updates elapsedPlaybackTime and playbackRate when state changes
+        // No manual updates needed here. If CarPlay progress bar isn't updating correctly,
+        // we may need to re-enable manual updates via nowPlayingInfoController.set()
+        
         eventEmitter?.emitPlaybackProgressUpdated([
             "position": player.currentTime,
             "duration": player.duration,
@@ -924,69 +940,6 @@ public class TrackPlayer: NSObject, AudioSessionControllerDelegate {
         ])
     }
     
-    // MARK: - MusicControl Integration
-    
-    private func updateMusicControlState(state: AVPlayerWrapperState) {
-        let center = MPNowPlayingInfoCenter.default()
-        
-        guard center.nowPlayingInfo != nil else {
-            return
-        }
-        
-        var details: [String: Any] = [:]
-        var mediaState: String
-        
-        // Map AVPlayerWrapperState to MusicControl state
-        switch state {
-        case .playing:
-            mediaState = "STATE_PLAYING"
-        case .paused:
-            mediaState = "STATE_PAUSED"
-        case .stopped:
-            mediaState = "STATE_STOPPED"
-        case .loading, .buffering:
-            mediaState = "STATE_BUFFERING"
-        case .failed:
-            mediaState = "STATE_ERROR"
-        case .ready:
-            mediaState = "STATE_READY"
-        case .ended:
-            mediaState = "STATE_STOPPED"
-        @unknown default:
-            mediaState = "STATE_READY"
-        }
-        
-        details["state"] = mediaState
-        
-        // Set the playback rate from the state if no speed has been defined
-        let speed: NSNumber = (mediaState == "STATE_PAUSED" || mediaState == "STATE_STOPPED") ? 0.0 : 1.0
-        details["speed"] = speed
-        
-        // Handle stopped state - disable stop command
-        if mediaState == "STATE_STOPPED" {
-            let remoteCenter = MPRemoteCommandCenter.shared()
-            remoteCenter.stopCommand.isEnabled = false
-        }
-        
-        // Update now playing info
-        var mediaDict = center.nowPlayingInfo ?? [:]
-        mediaDict.merge(details) { (_, new) in new }
-        center.nowPlayingInfo = mediaDict
-        
-        // Update playback state for iOS 11+
-        if #available(iOS 11.0, *) {
-            switch mediaState {
-            case "STATE_PLAYING":
-                center.playbackState = .playing
-            case "STATE_PAUSED":
-                center.playbackState = .paused
-            case "STATE_STOPPED":
-                center.playbackState = .stopped
-            default:
-                break
-            }
-        }
-    }
     
     // MARK: - Sleep Timer Methods (Stub Implementations)
     

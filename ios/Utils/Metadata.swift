@@ -44,28 +44,6 @@ struct Metadata {
         // Update SwiftAudioEx controller
         player.nowPlayingInfoController.set(keyValues: ret)
         
-        // Also directly update MPNowPlayingInfoCenter as backup for CarPlay and other scenarios
-        var nowPlayingInfo: [String: Any] = [:]
-        for keyValue in ret {
-            switch keyValue {
-            case let MediaItemProperty.title(title):
-                nowPlayingInfo[MPMediaItemPropertyTitle] = title
-            case let MediaItemProperty.artist(artist):
-                nowPlayingInfo[MPMediaItemPropertyArtist] = artist
-            case let MediaItemProperty.albumTitle(album):
-                nowPlayingInfo[MPMediaItemPropertyAlbumTitle] = album
-            case let MediaItemProperty.duration(duration):
-                nowPlayingInfo[MPMediaItemPropertyPlaybackDuration] = duration
-            case let NowPlayingInfoProperty.elapsedPlaybackTime(elapsedTime):
-                nowPlayingInfo[MPNowPlayingInfoPropertyElapsedPlaybackTime] = elapsedTime
-            case let NowPlayingInfoProperty.isLiveStream(isLiveStream):
-                nowPlayingInfo[MPNowPlayingInfoPropertyIsLiveStream] = isLiveStream
-            default:
-                break
-            }
-        }
-        MPNowPlayingInfoCenter.default().nowPlayingInfo = nowPlayingInfo
-        
         if let artworkURL = MediaURL(object: metadata["artwork"]) {
             currentImageTask = URLSession.shared.dataTask(with: artworkURL.value, completionHandler: { [weak player] (data, _, error) in
                 if let data = data, let image = UIImage(data: data), error == nil {
@@ -74,23 +52,13 @@ struct Metadata {
                     })
                     // Update SwiftAudioEx controller
                     player?.nowPlayingInfoController.set(keyValue: MediaItemProperty.artwork(artwork))
-                    
-                    // Also directly update MPNowPlayingInfoCenter
-                    var nowPlayingInfo = MPNowPlayingInfoCenter.default().nowPlayingInfo ?? [:]
-                    nowPlayingInfo[MPMediaItemPropertyArtwork] = artwork
-                    MPNowPlayingInfoCenter.default().nowPlayingInfo = nowPlayingInfo
                 }
             })
             
             currentImageTask?.resume()
         } else {
-            // Update SwiftAudioEx controller
+            // Update SwiftAudioEx controller 
             player.nowPlayingInfoController.set(keyValue: MediaItemProperty.artwork(nil))
-            
-            // Also directly update MPNowPlayingInfoCenter
-            var nowPlayingInfo = MPNowPlayingInfoCenter.default().nowPlayingInfo ?? [:]
-            nowPlayingInfo[MPMediaItemPropertyArtwork] = nil
-            MPNowPlayingInfoCenter.default().nowPlayingInfo = nowPlayingInfo
         }
     }
 }
