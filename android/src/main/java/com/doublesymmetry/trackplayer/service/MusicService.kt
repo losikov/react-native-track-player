@@ -228,9 +228,23 @@ class MusicService : HeadlessJsMediaService(), AudioManager.OnAudioFocusChangeLi
             notificationBuilder.foregroundServiceBehavior = NotificationCompat.FOREGROUND_SERVICE_IMMEDIATE
         }
         val notification = notificationBuilder.build()
-        startForeground(EMPTY_NOTIFICATION_ID, notification)
-        @Suppress("DEPRECATION")
-        stopForeground(true)
+        try {
+            startForeground(EMPTY_NOTIFICATION_ID, notification)
+            @Suppress("DEPRECATION")
+            stopForeground(true)
+        } catch (error: Exception) {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S &&
+                error is android.app.ForegroundServiceStartNotAllowedException
+            ) {
+                Timber.e(
+                    "ForegroundServiceStartNotAllowedException: Cannot start foreground service in startAndStopEmptyNotificationToAvoidANR. This is non-fatal.",
+                    error
+                )
+                // Non-fatal: The service will still work, just without the ANR workaround
+            } else {
+                throw error
+            }
+        }
     }
 
     @MainThread
