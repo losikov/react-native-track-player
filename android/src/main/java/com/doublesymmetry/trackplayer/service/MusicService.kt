@@ -11,6 +11,7 @@ import android.os.Binder
 import android.os.Build
 import android.os.Bundle
 import android.os.IBinder
+import android.provider.MediaStore
 import android.provider.Settings
 import android.support.v4.media.MediaBrowserCompat.MediaItem
 import android.support.v4.media.RatingCompat
@@ -115,21 +116,29 @@ class MusicService : HeadlessJsMediaService(), AudioManager.OnAudioFocusChangeLi
             clientUid: Int,
             rootHints: Bundle?
     ): BrowserRoot {
-        // TODO: verify clientPackageName here.
-        Timber.tag("RNTP-AA").d(clientPackageName + " attempted to get Browsable root.")
-        if (clientPackageName in arrayOf<String>(
-                "com.android.systemui",
-                "com.example.android.mediacontroller",
-                "com.google.android.projection.gearhead"
-        )) {
+        Timber.tag("RNTP-AA").d("$clientPackageName (uid=$clientUid) attempted to get Browsable root.")
+
+        // Whitelist of known media clients (Android Auto, System UI, Google Assistant, etc.)
+        val whitelistedClients = arrayOf(
+            "com.android.systemui",
+            "com.example.android.mediacontroller",
+            "com.google.android.projection.gearhead", // Android Auto
+            "com.google.android.googlequicksearchbox", // Google Assistant
+            "com.google.android.apps.search", // Google Search/Assistant
+        )
+
+        // HACK: Wake activity for whitelisted clients if React Native isn't initialized
+        // This is a workaround for React Native initialization timing. Ideally, MediaSession
+        // should be independent of the activity, but React Native requires the activity context.
+        // TODO: Remove this hack once React Native initialization is stabilized in the service.
+        if (clientPackageName in whitelistedClients) {
             val reactActivity = reactNativeHost.reactInstanceManager.currentReactContext?.currentActivity
             if (
-                // HACK: validate reactActivity is present; if not, send wake intent
                 (reactActivity == null || reactActivity.isDestroyed)
                 && Build.VERSION.SDK_INT >= Build.VERSION_CODES.M
                 && Settings.canDrawOverlays(this)
                 ) {
-                Log.d("RNTP-AA", clientPackageName + " is in the white list of waking activity.")
+                Timber.tag("RNTP-AA").d("$clientPackageName is whitelisted, waking activity for React Native init.")
                 val activityIntent = packageManager.getLaunchIntentForPackage(packageName)
                 activityIntent!!.data = Uri.parse("trackplayer://service-bound")
                 activityIntent.action = Intent.ACTION_VIEW
@@ -137,6 +146,11 @@ class MusicService : HeadlessJsMediaService(), AudioManager.OnAudioFocusChangeLi
                 startActivity(activityIntent)
             }
         }
+
+        // CRITICAL: Always return a valid BrowserRoot for ALL clients
+        // Returning null would make the service undiscoverable by Google Assistant
+        // The MediaSession is created inside the service (via QueuedAudioPlayer) and
+        // is independent of the activity lifecycle, so we can always return a valid root.
         val extras = Bundle()
         extras.putInt(
             MediaConstants.DESCRIPTION_EXTRAS_KEY_CONTENT_STYLE_BROWSABLE,
@@ -146,6 +160,7 @@ class MusicService : HeadlessJsMediaService(), AudioManager.OnAudioFocusChangeLi
             MediaConstants.DESCRIPTION_EXTRAS_KEY_CONTENT_STYLE_PLAYABLE,
             mediaTreeStyle[1]
         )
+        // Use "/" as root ID - this is the standard Android convention and matches React Native
         return BrowserRoot("/", extras)
     }
 
@@ -286,9 +301,26 @@ class MusicService : HeadlessJsMediaService(), AudioManager.OnAudioFocusChangeLi
             }
 
             override fun handlePlayFromSearch(query: String?, extras: Bundle?) {
-                Timber.tag("GVA-RNTP").d("RNTP received req to play from query: %s", query)
+                Timber.tag("GVA-RNTP").d("RNTP received req to play from query: %s, extras: %s", query, extras)
                 val searchBundle = Bundle().apply {
                     putString("query", query ?: "")
+                    // Pass extras to React Native so SearchService can use artistName/albumName
+                    if (extras != null) {
+                        putBundle("extras", extras)
+                        // Also extract common extras as top-level keys for easier access
+                        extras.getString("android.intent.extra.artist")?.let {
+                            putString("artist", it)
+                        }
+                        extras.getString("android.intent.extra.album")?.let {
+                            putString("album", it)
+                        }
+                        extras.getString(MediaStore.EXTRA_MEDIA_ARTIST)?.let {
+                            putString("artist", it)
+                        }
+                        extras.getString(MediaStore.EXTRA_MEDIA_ALBUM)?.let {
+                            putString("album", it)
+                        }
+                    }
                 }
                 trackPlayerModule?.onRemotePlayFromSearch(searchBundle)
             }
