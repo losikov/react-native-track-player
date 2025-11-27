@@ -36,8 +36,8 @@ dependencies {
     
     // KotlinAudio from JitPack (GitHub)
     // Using branch-SNAPSHOT format - JitPack builds on-demand, first build may take 3-5 minutes
-    // Latest commit with Java 17 fix: 85758f3168487c1b9596a2e79b527c14457293d5
-    // For specific commit: 'com.github.losikov:KotlinAudio:85758f3'
+    // Latest commit with example module excluded: 2373a6f23e5a36eb5fdbbab8c6f2b2ac900313f9
+    // For specific commit: 'com.github.losikov:KotlinAudio:2373a6f'
     // Note: Make sure the branch 'aa23-media-session-fixes-from-dev-aa' is pushed to GitHub
     implementation 'com.github.losikov:KotlinAudio:aa23-media-session-fixes-from-dev-aa-SNAPSHOT'
     
