@@ -28,13 +28,15 @@ android {
 repositories {
     mavenCentral()
     google()
+    maven { url 'https://jitpack.io' }
 }
 
 dependencies {
     implementation 'com.facebook.react:react-native'
     
     // Keep existing dependencies
-    implementation 'com.github.lovegaoshi:KotlinAudio:v2.0.0-aa23'
+    // Using local source code instead of JitPack dependency
+    implementation project(':kotlin-audio')
     implementation "androidx.core:core-ktx:1.9.0"
     implementation "androidx.localbroadcastmanager:localbroadcastmanager:1.1.0"
     implementation "androidx.lifecycle:lifecycle-process:2.5.1"

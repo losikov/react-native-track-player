@@ -1152,6 +1152,20 @@ class TrackPlayerModule(
         }
     }
     
+    override fun onRemotePrepareId(data: Bundle) {
+        Timber.d("🎵 TrackPlayerModule.onRemotePrepareId")
+        scope.launch {
+            emitOnRemotePrepareId(Arguments.fromBundle(data))
+        }
+    }
+    
+    override fun onRemotePrepareFromSearch(data: Bundle) {
+        Timber.d("🎵 TrackPlayerModule.onRemotePrepareFromSearch")
+        scope.launch {
+            emitOnRemotePrepareFromSearch(Arguments.fromBundle(data))
+        }
+    }
+    
     override fun onRemoteSkip(data: Bundle) {
         Timber.d("🎵 TrackPlayerModule.onRemoteSkip")
         scope.launch {

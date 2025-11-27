@@ -374,6 +374,20 @@ export interface Spec extends TurboModule {
    */
   readonly onRemotePlayFromSearch: EventEmitter<{ query: string, extras: Object }>;
   
+  /**
+   * Triggered when Google Assistant prepares media for playback (for reduced latency).
+   * This is called before actual playback starts, allowing the app to prepare media in advance.
+   * PREPARE always means prepare without playing.
+   */
+  readonly onRemotePrepareId: EventEmitter<{ id: string }>;
+  
+  /**
+   * Triggered when Google Assistant prepares media from search query (for reduced latency).
+   * This is called before actual playback starts, allowing the app to prepare media in advance.
+   * PREPARE always means prepare without playing.
+   */
+  readonly onRemotePrepareFromSearch: EventEmitter<{ query: string; extras: Object }>;
+  
   // Audio ducking events for smart interruption handling
   readonly onRemoteDuck: EventEmitter<{ reason: 'began' | 'ended' }>;
 }
