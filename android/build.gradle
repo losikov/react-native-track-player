@@ -34,9 +34,13 @@ repositories {
 dependencies {
     implementation 'com.facebook.react:react-native'
     
-    // Keep existing dependencies
-    // Using local source code instead of JitPack dependency
-    implementation project(':kotlin-audio')
+    // KotlinAudio from JitPack (GitHub)
+    // Using commit hash for reliability. Once you make the branch the default, you can use:
+    // implementation 'com.github.losikov:KotlinAudio' (will use default branch)
+    // For branch name: com.github.losikov:KotlinAudio:BRANCH-COMMIT_HASH
+    // Current commit: 8d51eb4ffeb1c4a51b03e4dc8e9bc087c3ba228e (from aa23-media-session-fixes-from-dev-aa branch)
+    implementation 'com.github.losikov:KotlinAudio:8d51eb4'
+    
     implementation "androidx.core:core-ktx:1.9.0"
     implementation "androidx.localbroadcastmanager:localbroadcastmanager:1.1.0"
     implementation "androidx.lifecycle:lifecycle-process:2.5.1"
