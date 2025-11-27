@@ -137,38 +137,14 @@ class MusicService : HeadlessJsMediaService(), AudioManager.OnAudioFocusChangeLi
         // Use "/" as root ID - this is the standard Android convention and matches React Native
         val browserRoot = BrowserRoot("/", extras)
 
-        // HACK: Wake activity for whitelisted clients if React Native isn't initialized
-        // This is a workaround for React Native initialization timing. Ideally, MediaSession
-        // should be independent of the activity, but React Native requires the activity context.
-        // TODO: Remove this hack once React Native initialization is stabilized in the service.
-        // NOTE: Post to handler to ensure onGetRoot returns quickly (activity launch is async anyway)
-        val whitelistedClients = arrayOf(
-            "com.android.systemui",
-            "com.example.android.mediacontroller",
-            "com.google.android.projection.gearhead", // Android Auto
-            "com.google.android.googlequicksearchbox", // Google Assistant
-            "com.google.android.apps.search", // Google Search/Assistant
-        )
-        
-        if (clientPackageName in whitelistedClients) {
-            android.os.Handler(android.os.Looper.getMainLooper()).post {
-                val reactActivity = reactNativeHost.reactInstanceManager.currentReactContext?.currentActivity
-                if (
-                    (reactActivity == null || reactActivity.isDestroyed)
-                    && Build.VERSION.SDK_INT >= Build.VERSION_CODES.M
-                    && Settings.canDrawOverlays(this)
-                ) {
-                    Timber.tag("RNTP-AA").d("$clientPackageName is whitelisted, waking activity for React Native init.")
-                    val activityIntent = packageManager.getLaunchIntentForPackage(packageName)
-                    activityIntent?.let {
-                        it.data = Uri.parse("trackplayer://service-bound")
-                        it.action = Intent.ACTION_VIEW
-                        it.flags = Intent.FLAG_ACTIVITY_NEW_TASK
-                        startActivity(it)
-                    }
-                }
-            }
-        }
+        // MediaBrowserService should NEVER launch an Activity (per Google Assistant guidelines)
+        // The MediaSession is created inside the service (via QueuedAudioPlayer) and is independent
+        // of the activity lifecycle. Assistant will launch Activity based on PendingIntent from
+        // setSessionActivity() or notification's PendingIntent if needed.
+        // 
+        // NOTE: Removed the Activity launch workaround that violated the "never launch Activity" rule.
+        // If React Native needs to be initialized, it should be done through proper service initialization
+        // or when the Activity is launched by the system/Assistant, not from MediaBrowserService.
 
         return browserRoot
     }
@@ -379,6 +355,25 @@ class MusicService : HeadlessJsMediaService(), AudioManager.OnAudioFocusChangeLi
         player = QueuedAudioPlayer(this@MusicService, playerConfig, bufferConfig, cacheConfig, mediaSessionCallback)
         player.automaticallyUpdateNotificationMetadata = automaticallyUpdateNotificationMetadata
         sessionToken = player.getMediaSessionToken()
+        
+        // Set session activity PendingIntent so Google Assistant can launch Activity when needed
+        // This allows Assistant to launch the Activity based on PendingIntent, rather than service launching it
+        val sessionActivityIntent = packageManager.getLaunchIntentForPackage(packageName)?.apply {
+            flags = Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP
+            action = Intent.ACTION_VIEW
+            data = Uri.parse("trackplayer://session-activity")
+        }
+        sessionActivityIntent?.let {
+            val sessionActivityPendingIntent = PendingIntent.getActivity(
+                this,
+                0,
+                it,
+                getPendingIntentFlags()
+            )
+            player.setSessionActivity(sessionActivityPendingIntent)
+            Timber.d("🎵 MusicService.setupPlayer: setSessionActivity() called with PendingIntent for MainActivity")
+        }
+        
         observeEvents()
         setupForegrounding()
     }
