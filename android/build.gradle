@@ -35,11 +35,10 @@ dependencies {
     implementation 'com.facebook.react:react-native'
     
     // KotlinAudio from JitPack (GitHub)
-    // Using commit hash for reliability. Once you make the branch the default, you can use:
-    // implementation 'com.github.losikov:KotlinAudio' (will use default branch)
-    // For branch name: com.github.losikov:KotlinAudio:BRANCH-COMMIT_HASH
-    // Current commit: 8d51eb4ffeb1c4a51b03e4dc8e9bc087c3ba228e (from aa23-media-session-fixes-from-dev-aa branch)
-    implementation 'com.github.losikov:KotlinAudio:8d51eb4'
+    // Using branch-SNAPSHOT format - JitPack builds on-demand, first build may take 3-5 minutes
+    // For specific commit: 'com.github.losikov:KotlinAudio:8d51eb4ffeb1c4a51b03e4dc8e9bc087c3ba228e'
+    // Note: Make sure the branch 'aa23-media-session-fixes-from-dev-aa' is pushed to GitHub
+    implementation 'com.github.losikov:KotlinAudio:aa23-media-session-fixes-from-dev-aa-SNAPSHOT'
     
     implementation "androidx.core:core-ktx:1.9.0"
     implementation "androidx.localbroadcastmanager:localbroadcastmanager:1.1.0"
