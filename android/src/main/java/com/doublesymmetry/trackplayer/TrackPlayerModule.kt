@@ -293,45 +293,46 @@ class TrackPlayerModule(
 
         // MEDIA_TYPE: Add media type to extras for Google Assistant recommendations
         // mediaType is required in TypeScript, but we default to AUDIOBOOK for safety
+        // Use string key directly as MediaConstants doesn't have METADATA_KEY_MEDIA_TYPE in ExoPlayer 2.19.1
         val mediaTypeString = hashmap["mediaType"] ?: "AUDIO_BOOK"
         val mediaType = mapContentTypeToMediaConstant(mediaTypeString)
-        extras.putInt(MediaConstants.METADATA_KEY_MEDIA_TYPE, mediaType)
+        extras.putInt("android.media.metadata.MEDIA_TYPE", mediaType)
 
         mediaDescriptionBuilder.setExtras(extras)
         return MediaItem(mediaDescriptionBuilder.build(), playableFlag)
     }
 
     /**
-     * Maps content type string from React Native to MediaConstants.MEDIA_TYPE_* constant.
-     * Defaults to MEDIA_TYPE_AUDIOBOOK if type is not recognized.
+     * Maps content type string from React Native to android.media.MediaMetadata.MEDIA_TYPE integer constants.
+     * Defaults to MEDIA_TYPE_AUDIOBOOK (11) if type is not recognized.
      * 
-     * Supported types from React Native:
-     * - "ALBUM" -> MEDIA_TYPE_ALBUM
-     * - "ARTIST" -> MEDIA_TYPE_ARTIST
-     * - "PLAYLIST" -> MEDIA_TYPE_PLAYLIST
-     * - "TV_SHOW_EPISODE" -> MEDIA_TYPE_TV_SHOW_EPISODE
-     * - "PODCAST_EPISODE" -> MEDIA_TYPE_PODCAST_EPISODE
-     * - "MUSIC" -> MEDIA_TYPE_MUSIC
-     * - "AUDIO_BOOK" or "AUDIOBOOK" -> MEDIA_TYPE_AUDIOBOOK (default)
-     * - "RADIO_STATION" -> MEDIA_TYPE_RADIO_STATION
-     * - "VIDEO" -> MEDIA_TYPE_VIDEO
-     * - "NEWS" -> MEDIA_TYPE_NEWS
+     * Media type constants from android.media.MediaMetadata (API 21+):
+     * - MEDIA_TYPE_MUSIC = 1
+     * - MEDIA_TYPE_ALBUM = 2
+     * - MEDIA_TYPE_ARTIST = 3
+     * - MEDIA_TYPE_PLAYLIST = 4
+     * - MEDIA_TYPE_TV_SHOW_EPISODE = 5
+     * - MEDIA_TYPE_PODCAST_EPISODE = 6
+     * - MEDIA_TYPE_VIDEO = 7
+     * - MEDIA_TYPE_NEWS = 8
+     * - MEDIA_TYPE_AUDIOBOOK = 11
+     * - MEDIA_TYPE_RADIO_STATION = 12
      */
     private fun mapContentTypeToMediaConstant(contentType: String): Int {
         return when (contentType.uppercase()) {
-            "ALBUM" -> MediaConstants.MEDIA_TYPE_ALBUM
-            "ARTIST" -> MediaConstants.MEDIA_TYPE_ARTIST
-            "PLAYLIST" -> MediaConstants.MEDIA_TYPE_PLAYLIST
-            "TV_SHOW_EPISODE" -> MediaConstants.MEDIA_TYPE_TV_SHOW_EPISODE
-            "PODCAST_EPISODE" -> MediaConstants.MEDIA_TYPE_PODCAST_EPISODE
-            "MUSIC" -> MediaConstants.MEDIA_TYPE_MUSIC
-            "AUDIO_BOOK", "AUDIOBOOK" -> MediaConstants.MEDIA_TYPE_AUDIOBOOK
-            "RADIO_STATION" -> MediaConstants.MEDIA_TYPE_RADIO_STATION
-            "VIDEO" -> MediaConstants.MEDIA_TYPE_VIDEO
-            "NEWS" -> MediaConstants.MEDIA_TYPE_NEWS
+            "MUSIC" -> 1 // MediaMetadata.MEDIA_TYPE_MUSIC
+            "ALBUM" -> 2 // MediaMetadata.MEDIA_TYPE_ALBUM
+            "ARTIST" -> 3 // MediaMetadata.MEDIA_TYPE_ARTIST
+            "PLAYLIST" -> 4 // MediaMetadata.MEDIA_TYPE_PLAYLIST
+            "TV_SHOW_EPISODE" -> 5 // MediaMetadata.MEDIA_TYPE_TV_SHOW_EPISODE
+            "PODCAST_EPISODE" -> 6 // MediaMetadata.MEDIA_TYPE_PODCAST_EPISODE
+            "VIDEO" -> 7 // MediaMetadata.MEDIA_TYPE_VIDEO
+            "NEWS" -> 8 // MediaMetadata.MEDIA_TYPE_NEWS
+            "AUDIO_BOOK", "AUDIOBOOK" -> 11 // MediaMetadata.MEDIA_TYPE_AUDIOBOOK
+            "RADIO_STATION" -> 12 // MediaMetadata.MEDIA_TYPE_RADIO_STATION
             else -> {
                 // Default to AUDIOBOOK for unknown types (we're primarily an audiobook app)
-                MediaConstants.MEDIA_TYPE_AUDIOBOOK
+                11 // MediaMetadata.MEDIA_TYPE_AUDIOBOOK
             }
         }
     }
@@ -1218,6 +1219,31 @@ class TrackPlayerModule(
         Timber.d("🎵 TrackPlayerModule.onRemoteDuck")
         scope.launch {
             emitOnRemoteDuck(Arguments.fromBundle(data))
+        }
+    }
+    
+    // ===== Error Reporting =====
+    
+    /**
+     * Set PlaybackState error for Google Assistant recognition.
+     * Called from React Native when content is not found or actions fail.
+     * 
+     * @param errorCode PlaybackStateCompat error code (e.g., ERROR_CODE_NOT_SUPPORTED, ERROR_CODE_APP_ERROR)
+     * @param errorMessage User-readable error message
+     */
+    override fun setPlaybackStateError(errorCode: Double, errorMessage: String, promise: Promise) {
+        if (!verifyServiceBoundOrReject(promise)) return
+        
+        try {
+            val player = musicService.getPlayer()
+            if (player != null) {
+                player.setPlaybackStateError(errorCode.toInt(), errorMessage)
+                promise.resolve(null)
+            } else {
+                promise.reject("player_not_initialized", "Player not initialized")
+            }
+        } catch (e: Exception) {
+            promise.reject("error_setting_playback_state_error", e.message ?: "Unknown error", e)
         }
     }
 }
