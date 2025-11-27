@@ -84,6 +84,13 @@ interface MusicServiceEventListener {
 @MainThread
 class MusicService : HeadlessJsMediaService(), AudioManager.OnAudioFocusChangeListener {
     private lateinit var player: QueuedAudioPlayer
+    
+    /**
+     * Get the player instance (for error reporting from external components)
+     */
+    fun getPlayer(): QueuedAudioPlayer? {
+        return if (::player.isInitialized) player else null
+    }
     private val binder = MusicBinder()
     private val scope = MainScope()
     private var progressUpdateJob: Job? = null
@@ -300,6 +307,14 @@ class MusicService : HeadlessJsMediaService(), AudioManager.OnAudioFocusChangeLi
         val mediaSessionCallback = object: AAMediaSessionCallBack {
             override fun handlePlayFromMediaId(mediaId: String?, extras: Bundle?) {
                 Timber.tag("GVA-RNTP").d("RNTP received req to play from mediaID: %s", mediaId)
+                if (mediaId.isNullOrEmpty()) {
+                    // Invalid media ID - set error state
+                    player?.setPlaybackStateError(
+                        android.support.v4.media.session.PlaybackStateCompat.ERROR_CODE_APP_ERROR,
+                        "Invalid media ID provided"
+                    )
+                    return
+                }
                 trackPlayerModule?.onRemotePlayId((extras ?: Bundle()).apply {
                     putString("id", mediaId)
                 })
@@ -307,22 +322,35 @@ class MusicService : HeadlessJsMediaService(), AudioManager.OnAudioFocusChangeLi
 
             override fun handlePlayFromSearch(query: String?, extras: Bundle?) {
                 Timber.tag("GVA-RNTP").d("RNTP received req to play from query: %s, extras: %s", query, extras)
+                
+                // Extract search parameters to check if query is valid
+                val searchQuery = query ?: ""
+                val artistName = extras?.getString("android.intent.extra.artist")
+                    ?: extras?.getString(MediaStore.EXTRA_MEDIA_ARTIST)
+                val albumName = extras?.getString("android.intent.extra.album")
+                    ?: extras?.getString(MediaStore.EXTRA_MEDIA_ALBUM)
+                val title = extras?.getString(MediaStore.EXTRA_MEDIA_TITLE)
+                
+                // Check if we have any searchable parameters
+                val hasSearchParams = searchQuery.isNotEmpty() || 
+                    artistName != null || albumName != null || title != null
+                
+                if (!hasSearchParams) {
+                    // Empty query with no metadata - this will be handled by React Native
+                    // but we can set a warning (not an error, as onPlay() might handle it)
+                    Timber.tag("GVA-RNTP").w("Empty search query with no metadata provided")
+                }
+                
                 val searchBundle = Bundle().apply {
-                    putString("query", query ?: "")
+                    putString("query", searchQuery)
                     // Pass extras to React Native so SearchService can use artistName/albumName
                     if (extras != null) {
                         putBundle("extras", extras)
                         // Also extract common extras as top-level keys for easier access
-                        extras.getString("android.intent.extra.artist")?.let {
+                        artistName?.let {
                             putString("artist", it)
                         }
-                        extras.getString("android.intent.extra.album")?.let {
-                            putString("album", it)
-                        }
-                        extras.getString(MediaStore.EXTRA_MEDIA_ARTIST)?.let {
-                            putString("artist", it)
-                        }
-                        extras.getString(MediaStore.EXTRA_MEDIA_ALBUM)?.let {
+                        albumName?.let {
                             putString("album", it)
                         }
                     }
@@ -332,6 +360,14 @@ class MusicService : HeadlessJsMediaService(), AudioManager.OnAudioFocusChangeLi
             
             override fun handlePrepareFromMediaId(mediaId: String?, extras: Bundle?) {
                 Timber.tag("GVA-RNTP").d("RNTP received req to prepare from mediaID: %s", mediaId)
+                if (mediaId.isNullOrEmpty()) {
+                    // Invalid media ID - set error state
+                    player?.setPlaybackStateError(
+                        android.support.v4.media.session.PlaybackStateCompat.ERROR_CODE_APP_ERROR,
+                        "Invalid media ID provided"
+                    )
+                    return
+                }
                 trackPlayerModule?.onRemotePrepareId((extras ?: Bundle()).apply {
                     putString("id", mediaId)
                     putBoolean("playWhenReady", false) // PREPARE always means prepare without playing

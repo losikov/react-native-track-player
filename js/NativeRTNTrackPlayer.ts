@@ -341,6 +341,9 @@ export interface Spec extends TurboModule {
   updateOptions(options: UpdateOptions): Promise<void>;
   destroy(): Promise<void>;
   
+  // Error reporting
+  setPlaybackStateError(errorCode: number, errorMessage: string): Promise<void>;
+  
   // Event emitters
   readonly onPlaybackState: EventEmitter<{ state: PlaybackState; error?: PlaybackErrorEvent }>;
   readonly onPlaybackProgressUpdated: EventEmitter<Progress>;

@@ -41,6 +41,9 @@ export {
   State,
 } from '../js/NativeRTNTrackPlayer';
 
+// Re-export setPlaybackStateError for error reporting
+export { default as TrackPlayer } from '../js/NativeRTNTrackPlayer';
+
 // Service registration for background playback
 // In New Architecture, we don't use headless tasks - just call the factory directly
 export function registerPlaybackService(factory: () => () => void) {
