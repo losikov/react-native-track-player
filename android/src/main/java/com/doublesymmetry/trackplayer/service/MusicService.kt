@@ -159,6 +159,12 @@ class MusicService : HeadlessJsMediaService(), AudioManager.OnAudioFocusChangeLi
         // NOTE: Removed the Activity launch workaround that violated the "never launch Activity" rule.
         // If React Native needs to be initialized, it should be done through proper service initialization
         // or when the Activity is launched by the system/Assistant, not from MediaBrowserService.
+        //
+        // DRIVING MODE: The MediaSession playback state is managed by QueuedAudioPlayer based on actual
+        // playback state. When nothing is playing, the state is automatically STATE_NONE, which prevents
+        // the app from being brought to foreground during driving mode when onGetRoot() is called for
+        // recommendations. The MediaSessionConnector automatically updates playback state based on ExoPlayer
+        // state, so no explicit state management is needed here.
 
         return browserRoot
     }
