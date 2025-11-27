@@ -171,6 +171,13 @@ export interface AndroidAutoBrowseTree {
   [key: string]: any;
 }
 
+// Media Type enum for Google Assistant recommendations
+export enum MediaType {
+  Audiobook = 'AUDIO_BOOK',
+  Podcast = 'PODCAST_EPISODE',
+  Music = 'MUSIC',
+}
+
 // Media Item for Android Auto
 export interface MediaItem {
   id: string;
@@ -183,6 +190,8 @@ export interface MediaItem {
   contentStyle?: string;
   playbackProgress?: string;
   children?: MediaItem[];
+  /** mediaType for Google Assistant recommendations */
+  mediaType: MediaType;
 }
 
 // Repeat Mode

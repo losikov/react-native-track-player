@@ -1,5 +1,5 @@
 import type { ResourceObject } from './ResourceObject';
-import { MediaItemPlayable } from '../../js/NativeRTNTrackPlayer';
+import { MediaItemPlayable, MediaType } from '../../js/NativeRTNTrackPlayer';
 
 export interface MediaItem {
   mediaId: string;
@@ -16,4 +16,6 @@ export interface MediaItem {
   childrenBrowsableContentStyle?: string;
   /** playbackProgress should contain a string representation of a number between 0 and 1 if present */
   playbackProgress?: string;
+  /** mediaType for Google Assistant recommendations */
+  mediaType: MediaType;
 }

@@ -291,8 +291,49 @@ class TrackPlayerModule(
             }
         }
 
+        // MEDIA_TYPE: Add media type to extras for Google Assistant recommendations
+        // mediaType is required in TypeScript, but we default to AUDIOBOOK for safety
+        val mediaTypeString = hashmap["mediaType"] ?: "AUDIO_BOOK"
+        val mediaType = mapContentTypeToMediaConstant(mediaTypeString)
+        extras.putInt(MediaConstants.METADATA_KEY_MEDIA_TYPE, mediaType)
+
         mediaDescriptionBuilder.setExtras(extras)
         return MediaItem(mediaDescriptionBuilder.build(), playableFlag)
+    }
+
+    /**
+     * Maps content type string from React Native to MediaConstants.MEDIA_TYPE_* constant.
+     * Defaults to MEDIA_TYPE_AUDIOBOOK if type is not recognized.
+     * 
+     * Supported types from React Native:
+     * - "ALBUM" -> MEDIA_TYPE_ALBUM
+     * - "ARTIST" -> MEDIA_TYPE_ARTIST
+     * - "PLAYLIST" -> MEDIA_TYPE_PLAYLIST
+     * - "TV_SHOW_EPISODE" -> MEDIA_TYPE_TV_SHOW_EPISODE
+     * - "PODCAST_EPISODE" -> MEDIA_TYPE_PODCAST_EPISODE
+     * - "MUSIC" -> MEDIA_TYPE_MUSIC
+     * - "AUDIO_BOOK" or "AUDIOBOOK" -> MEDIA_TYPE_AUDIOBOOK (default)
+     * - "RADIO_STATION" -> MEDIA_TYPE_RADIO_STATION
+     * - "VIDEO" -> MEDIA_TYPE_VIDEO
+     * - "NEWS" -> MEDIA_TYPE_NEWS
+     */
+    private fun mapContentTypeToMediaConstant(contentType: String): Int {
+        return when (contentType.uppercase()) {
+            "ALBUM" -> MediaConstants.MEDIA_TYPE_ALBUM
+            "ARTIST" -> MediaConstants.MEDIA_TYPE_ARTIST
+            "PLAYLIST" -> MediaConstants.MEDIA_TYPE_PLAYLIST
+            "TV_SHOW_EPISODE" -> MediaConstants.MEDIA_TYPE_TV_SHOW_EPISODE
+            "PODCAST_EPISODE" -> MediaConstants.MEDIA_TYPE_PODCAST_EPISODE
+            "MUSIC" -> MediaConstants.MEDIA_TYPE_MUSIC
+            "AUDIO_BOOK", "AUDIOBOOK" -> MediaConstants.MEDIA_TYPE_AUDIOBOOK
+            "RADIO_STATION" -> MediaConstants.MEDIA_TYPE_RADIO_STATION
+            "VIDEO" -> MediaConstants.MEDIA_TYPE_VIDEO
+            "NEWS" -> MediaConstants.MEDIA_TYPE_NEWS
+            else -> {
+                // Default to AUDIOBOOK for unknown types (we're primarily an audiobook app)
+                MediaConstants.MEDIA_TYPE_AUDIOBOOK
+            }
+        }
     }
 
     override fun add(tracks: ReadableArray, insertBeforeIndex: Double, promise: Promise) {

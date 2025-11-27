@@ -33,6 +33,7 @@ export type {
 export {
   AndroidAutoContentStyle,
   MediaItemPlayable,
+  MediaType,
   RepeatMode,
   Capability,
   TrackType,

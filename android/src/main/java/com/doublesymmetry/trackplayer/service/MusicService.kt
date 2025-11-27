@@ -134,8 +134,22 @@ class MusicService : HeadlessJsMediaService(), AudioManager.OnAudioFocusChangeLi
             MediaConstants.DESCRIPTION_EXTRAS_KEY_CONTENT_STYLE_PLAYABLE,
             mediaTreeStyle[1]
         )
-        // Use "/" as root ID - this is the standard Android convention and matches React Native
-        val browserRoot = BrowserRoot("/", extras)
+        
+        // Check if Google Assistant is requesting suggested items
+        // EXTRA_SUGGESTED constant: "android.service.media.extra.SUGGESTED"
+        val isRequestingSuggested = rootHints?.getBoolean(
+            "android.service.media.extra.SUGGESTED",
+            false
+        ) ?: false
+        
+        // Return different root ID for suggested items vs normal browsing
+        val rootId = if (isRequestingSuggested) {
+            "/suggested"  // Root for Google Assistant recommendations
+        } else {
+            "/"  // Default root for normal browsing
+        }
+        
+        val browserRoot = BrowserRoot(rootId, extras)
 
         // MediaBrowserService should NEVER launch an Activity (per Google Assistant guidelines)
         // The MediaSession is created inside the service (via QueuedAudioPlayer) and is independent
