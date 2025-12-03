@@ -25,6 +25,17 @@
             </intent-filter>
         </service>
 
+        <!-- Custom ContentProvider for exposing cached images to Android Auto -->
+        <!-- Converts file:// URIs to content:// URIs for MediaBrowserService artwork -->
+        <!-- The authority will be resolved at runtime using the host app's package name -->
+        <!-- exported="true" is required for Android Auto to access images across process boundaries -->
+        <!-- grantUriPermissions="true" allows Android Auto to read the images via content:// URIs -->
+        <provider
+            android:name="com.doublesymmetry.trackplayer.provider.ImageContentProvider"
+            android:authorities="${applicationId}.trackplayer.imageprovider"
+            android:exported="true"
+            android:grantUriPermissions="true" />
+
     </application>
 
 </manifest>

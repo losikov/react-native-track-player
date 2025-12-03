@@ -23,6 +23,7 @@ import com.doublesymmetry.trackplayer.service.MusicService
 import com.doublesymmetry.trackplayer.service.MusicServiceEventListener
 import com.doublesymmetry.trackplayer.utils.AppForegroundTracker
 import com.doublesymmetry.trackplayer.utils.RejectionException
+import com.doublesymmetry.trackplayer.utils.UriUtils
 import com.facebook.react.bridge.*
 import com.google.android.exoplayer2.DefaultLoadControl.*
 import com.google.android.exoplayer2.Player
@@ -235,9 +236,9 @@ class TrackPlayerModule(
     }
 
     private fun readableArrayToMediaItems(data: ArrayList<HashMap<String, String>>): MutableList<MediaItem> {
-        return data.map {
-            hashmapToMediaItem(it)
-        }.toMutableList()
+        return data.map { hashmap ->
+            hashmapToMediaItem(hashmap)
+        }.filterNotNull().toMutableList()
     }
 
     private fun hashmapToMediaItem(hashmap: HashMap<String, String>): MediaItem {
@@ -253,7 +254,40 @@ class TrackPlayerModule(
         mediaDescriptionBuilder.setTitle(title)
         mediaDescriptionBuilder.setSubtitle(subtitle)
         mediaDescriptionBuilder.setMediaUri(if (mediaUri != null) Uri.parse(mediaUri) else null)
-        mediaDescriptionBuilder.setIconUri(if (iconUri != null) Uri.parse(iconUri) else null)
+        
+        // Convert URIs for Android Auto compatibility
+        // Android Auto requires content:// URIs for grid artwork, not HTTP/HTTPS URLs
+        // For file:// URIs, convert to content:// via ImageContentProvider
+        // For HTTP/HTTPS URLs, check if cached locally and convert to content://, otherwise log warning
+        iconUri?.let {
+            val uri = Uri.parse(it)
+            val finalIconUri = when {
+                uri.scheme == "file" -> {
+                    // Convert file:// to content://
+                    val convertedIconUri = UriUtils.convertFileUriToContentUri(reactContext, it)
+                    if (convertedIconUri != null) {
+                        Uri.parse(convertedIconUri)
+                    } else {
+                        Timber.tag("RNTP-AA").w("Failed to convert file:// URI, using original: $it")
+                        uri
+                    }
+                }
+                uri.scheme == "http" || uri.scheme == "https" -> {
+                    // For HTTPS URLs, try to find cached version and convert to content://
+                    // Android Auto requires content:// URIs for grid items, not HTTP/HTTPS
+                    val cachedUri = UriUtils.convertHttpUriToContentUri(reactContext, it)
+                    if (cachedUri != null) {
+                        Uri.parse(cachedUri)
+                    } else {
+                        Timber.tag("RNTP-AA").w("HTTPS URL not cached locally - Android Auto may not display this image: $it")
+                        Timber.tag("RNTP-AA").w("Consider downloading and caching images before setting iconUri for grid items")
+                        uri // Fallback to HTTPS URL (may not work in Android Auto)
+                    }
+                }
+                else -> uri
+            }
+            mediaDescriptionBuilder.setIconUri(finalIconUri)
+        }
         val extras = Bundle()
         hashmap["groupTitle"]?.let {
             extras.putString(
@@ -928,11 +962,15 @@ class TrackPlayerModule(
     override fun setBrowseTree(tree: ReadableMap, promise: Promise) {
         Timber.d("🎵 TurboModule setBrowseTree() called")
         scope.launch {
-            if (verifyServiceBoundOrReject(promise)) return@launch
+            if (verifyServiceBoundOrReject(promise)) {
+                return@launch
+            }
             try {
                 val mediaItemsMap = tree.toHashMap()
-                musicService.mediaTree = mediaItemsMap.mapValues { 
-                    readableArrayToMediaItems(it.value as ArrayList<HashMap<String, String>>) 
+                
+                musicService.mediaTree = mediaItemsMap.mapValues { entry ->
+                    val rawItems = entry.value as ArrayList<HashMap<String, String>>
+                    readableArrayToMediaItems(rawItems)
                 }
                 Timber.d("refreshing browseTree")
                 mediaItemsMap.keys.forEach {
@@ -940,6 +978,7 @@ class TrackPlayerModule(
                 }
                 promise.resolve(musicService.mediaTree.toString())
             } catch (exception: Exception) {
+                Timber.tag("RNTP-AA").e(exception, "setBrowseTree error")
                 promise.reject("runtime_exception", exception.message, exception)
             }
         }
@@ -1222,6 +1261,13 @@ class TrackPlayerModule(
         }
     }
     
+    override fun onRemoteSearch(data: Bundle) {
+        Timber.tag("TrackPlayerModule").d("onRemoteSearch")
+        scope.launch {
+            emitOnRemoteSearch(Arguments.fromBundle(data))
+        }
+    }
+    
     // ===== Error Reporting =====
     
     /**
@@ -1244,6 +1290,42 @@ class TrackPlayerModule(
             }
         } catch (e: Exception) {
             promise.reject("error_setting_playback_state_error", e.message ?: "Unknown error", e)
+        }
+    }
+    
+    /**
+     * Send search results back to MusicService to complete a search request
+     * Called from React Native after handleSearch returns results
+     * @param results Array of track objects with metadata: { mediaId, title, artist?, album?, artwork? }
+     */
+    override fun sendSearchResults(searchId: String, results: ReadableArray, promise: Promise) {
+        Timber.tag("TrackPlayerModule").d("sendSearchResults called with searchId: $searchId, count: ${results.size()}")
+        scope.launch {
+            if (verifyServiceBoundOrReject(promise)) return@launch
+            try {
+                val trackResults = mutableListOf<Map<String, String?>>()
+                for (i in 0 until results.size()) {
+                    val resultMap = results.getMap(i)
+                    if (resultMap != null) {
+                        val duration = resultMap.getDouble("duration")
+                        val trackData = mapOf(
+                            "mediaId" to resultMap.getString("mediaId"),
+                            "title" to resultMap.getString("title"),
+                            "artist" to resultMap.getString("artist"),
+                            "album" to resultMap.getString("album"),
+                            "artwork" to resultMap.getString("artwork"),
+                            "url" to resultMap.getString("url"),
+                            "duration" to if (!duration.isNaN()) duration.toString() else null
+                        )
+                        trackResults.add(trackData)
+                    }
+                }
+                musicService.sendSearchResults(searchId, trackResults)
+                promise.resolve(null)
+            } catch (e: Exception) {
+                Timber.tag("TrackPlayerModule").e(e, "Error in sendSearchResults")
+                promise.reject("error_sending_search_results", e.message ?: "Unknown error", e)
+            }
         }
     }
 }

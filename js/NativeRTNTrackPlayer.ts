@@ -344,6 +344,9 @@ export interface Spec extends TurboModule {
   // Error reporting
   setPlaybackStateError(errorCode: number, errorMessage: string): Promise<void>;
   
+  // Search results
+  sendSearchResults(searchId: string, results: Array<{ mediaId: string; title: string; artist?: string; album?: string; artwork?: string; url?: string; duration?: number }>): Promise<void>;
+  
   // Event emitters
   readonly onPlaybackState: EventEmitter<{ state: PlaybackState; error?: PlaybackErrorEvent }>;
   readonly onPlaybackProgressUpdated: EventEmitter<Progress>;
@@ -399,6 +402,13 @@ export interface Spec extends TurboModule {
    * PREPARE always means prepare without playing.
    */
   readonly onRemotePrepareFromSearch: EventEmitter<{ query: string; extras: Object }>;
+  
+  /**
+   * Triggered when Android Auto / Android Automotive OS requests browsable search results.
+   * This is called when the user searches for content in Android Auto's search interface.
+   * The app should return search results (media IDs) via sendSearchResults().
+   */
+  readonly onRemoteSearch: EventEmitter<{ searchId: string; query: string; artistName?: string; albumName?: string }>;
   
   // Audio ducking events for smart interruption handling
   readonly onRemoteDuck: EventEmitter<{ reason: 'began' | 'ended' }>;

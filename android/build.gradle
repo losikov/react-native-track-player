@@ -36,9 +36,10 @@ dependencies {
     
     // KotlinAudio from JitPack (GitHub)
     // Using specific commit hash for reproducibility (build is ready on JitPack)
-    // Commit: 2373a6f23e5a36eb5fdbbab8c6f2b2ac900313f9 (excludes example module, uses Java 17)
+    // Commit: 7ecd25350054af4c29b41ad77c63043736f90c08 (Android Auto artwork URI support with synchronous file loading)
+    // Branch: aa23-media-session-fixes-from-dev-aa
     // For latest from branch: 'com.github.losikov:KotlinAudio:aa23-media-session-fixes-from-dev-aa-SNAPSHOT'
-    implementation 'com.github.losikov:KotlinAudio:2373a6f'
+    implementation 'com.github.losikov:KotlinAudio:7ecd253'
     
     implementation "androidx.core:core-ktx:1.9.0"
     implementation "androidx.localbroadcastmanager:localbroadcastmanager:1.1.0"

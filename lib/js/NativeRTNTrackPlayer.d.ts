@@ -350,6 +350,17 @@ export interface Spec extends TurboModule {
         query: string;
         extras: Object;
     }>;
+    /**
+     * Triggered when Android Auto / Android Automotive OS requests browsable search results.
+     * This is called when the user searches for content in Android Auto's search interface.
+     * The app should return search results (media IDs) via sendSearchResults().
+     */
+    readonly onRemoteSearch: EventEmitter<{
+        searchId: string;
+        query: string;
+        artistName?: string;
+        albumName?: string;
+    }>;
     readonly onRemoteDuck: EventEmitter<{
         reason: 'began' | 'ended';
     }>;

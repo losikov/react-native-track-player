@@ -14,8 +14,8 @@ import android.os.IBinder
 import android.provider.MediaStore
 import android.provider.Settings
 import android.support.v4.media.MediaBrowserCompat.MediaItem
+import android.support.v4.media.MediaDescriptionCompat
 import android.support.v4.media.RatingCompat
-import android.util.Log
 import androidx.annotation.MainThread
 import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationCompat.PRIORITY_LOW
@@ -36,6 +36,7 @@ import com.doublesymmetry.trackplayer.module.MusicEvents
 import com.doublesymmetry.trackplayer.module.MusicEvents.Companion.METADATA_PAYLOAD_KEY
 import com.doublesymmetry.trackplayer.utils.BundleUtils
 import com.doublesymmetry.trackplayer.utils.BundleUtils.setRating
+import com.doublesymmetry.trackplayer.utils.UriUtils
 import com.facebook.react.jstasks.HeadlessJsTaskConfig
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.flow
@@ -77,6 +78,9 @@ interface MusicServiceEventListener {
     fun onRemotePrepareId(data: Bundle)
     fun onRemotePrepareFromSearch(data: Bundle)
     
+    // Search events
+    fun onRemoteSearch(data: Bundle)
+    
     // Audio interruption events
     fun onRemoteDuck(data: Bundle)
 }
@@ -105,12 +109,17 @@ class MusicService : HeadlessJsMediaService(), AudioManager.OnAudioFocusChangeLi
     // Audio focus handling
     private var audioManager: AudioManager? = null
     private var interruptionStartTime: Long? = null
+    
+    // Search result callbacks - map search ID to Result callback
+    private val pendingSearchResults = mutableMapOf<String, Result<List<MediaItem>>>()
+    private var searchIdCounter = 0
 
     @ExperimentalCoroutinesApi
     override fun onCreate() {
         Timber.tag("GVA-RNTP").d("RNTP musicservice created.")
         super.onCreate()
         audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+        MusicService.setInstance(this)
     }
 
     /**
@@ -127,6 +136,22 @@ class MusicService : HeadlessJsMediaService(), AudioManager.OnAudioFocusChangeLi
             rootHints: Bundle?
     ): BrowserRoot {
         Timber.tag("RNTP-AA").d("$clientPackageName (uid=$clientUid) attempted to get Browsable root.")
+        
+        // Log root hints to debug image quality issues
+        if (rootHints != null) {
+            Timber.tag("RNTP-AA").d("Root hints keys: ${rootHints.keySet()}")
+            for (key in rootHints.keySet()) {
+                val value = rootHints.get(key)
+                Timber.tag("RNTP-AA").d("Root hint: $key = $value (type: ${value?.javaClass?.simpleName})")
+            }
+            // Check for media art size hint (Android Auto tells us what size images it expects)
+            val artSizeHint = rootHints.getInt("android.media.browse.EXTRA_MEDIA_ART_SIZE_HINT_PIXELS", -1)
+            if (artSizeHint > 0) {
+                Timber.tag("RNTP-AA").d("Android Auto requests images at size: ${artSizeHint}x${artSizeHint} pixels")
+            }
+        } else {
+            Timber.tag("RNTP-AA").d("No root hints provided")
+        }
 
         // CRITICAL: Always return a valid BrowserRoot for ALL clients FIRST (return quickly)
         // Returning null would make the service undiscoverable by Google Assistant
@@ -140,6 +165,11 @@ class MusicService : HeadlessJsMediaService(), AudioManager.OnAudioFocusChangeLi
         extras.putInt(
             MediaConstants.DESCRIPTION_EXTRAS_KEY_CONTENT_STYLE_PLAYABLE,
             mediaTreeStyle[1]
+        )
+        // Declare search support for browsable search results
+        extras.putBoolean(
+            MediaConstants.BROWSER_SERVICE_EXTRAS_KEY_SEARCH_SUPPORTED,
+            true
         )
         
         // Check if Google Assistant is requesting suggested items
@@ -180,12 +210,175 @@ class MusicService : HeadlessJsMediaService(), AudioManager.OnAudioFocusChangeLi
             parentMediaId: String,
             result: Result<List<MediaItem>>
     ) {
-        Timber.tag("GVA-RNTP").d("RNTP received loadChildren req: %s", parentMediaId)
+        Timber.tag("GVA-RNTP").d("RNTP received loadChildren req: $parentMediaId")
         
         trackPlayerModule?.onRemoteBrowse(Bundle().apply {
             putString("mediaId", parentMediaId)
         })
         result.sendResult(mediaTree[parentMediaId])
+    }
+
+    override fun onSearch(
+            query: String,
+            extras: Bundle?,
+            result: Result<List<MediaItem>>
+    ) {
+        Timber.tag("RNTP-AA").d("RNTP received search req: query='$query', extras=$extras")
+        
+        // Detach from result to unblock the caller (search can be expensive)
+        result.detach()
+        
+        // Generate unique search ID
+        val searchId = "search_${++searchIdCounter}_${System.currentTimeMillis()}"
+        
+        // Store result callback for later
+        pendingSearchResults[searchId] = result
+        
+        // Extract search parameters from extras
+        val artistName = extras?.getString("android.intent.extra.artist")
+            ?: extras?.getString(MediaStore.EXTRA_MEDIA_ARTIST)
+        val albumName = extras?.getString("android.intent.extra.album")
+            ?: extras?.getString(MediaStore.EXTRA_MEDIA_ALBUM)
+        
+        // Call React Native to perform search
+        val searchBundle = Bundle().apply {
+            putString("searchId", searchId)
+            putString("query", query)
+            artistName?.let { putString("artistName", it) }
+            albumName?.let { putString("albumName", it) }
+        }
+        
+        Timber.tag("RNTP-AA").d("Calling React Native for search: searchId=$searchId, query='$query'")
+        val module = trackPlayerModule
+        if (module == null) {
+            Timber.tag("RNTP-AA").w("TrackPlayerModule is null, cannot perform search")
+            result.sendResult(emptyList())
+            pendingSearchResults.remove(searchId)
+            return
+        }
+        module.onRemoteSearch(searchBundle)
+        
+        // Note: Results will be returned via sendSearchResults() method
+    }
+    
+    /**
+     * Called from React Native (via TrackPlayerModule) to send search results back
+     * This completes the search request initiated by onSearch()
+     * @param trackResults List of maps containing track metadata: mediaId, title, artist, album, artwork
+     */
+    fun sendSearchResults(searchId: String, trackResults: List<Map<String, String?>>) {
+        Timber.tag("RNTP-AA").d("Received search results: searchId=$searchId, count=${trackResults.size}")
+        
+        val result = pendingSearchResults.remove(searchId)
+        if (result == null) {
+            Timber.tag("RNTP-AA").w("No pending search result found for searchId: $searchId")
+            return
+        }
+        
+        // Convert track metadata to MediaItem objects on background thread
+        scope.launch(Dispatchers.IO) {
+            try {
+                val mediaItems = trackResults.mapNotNull { trackData ->
+                    createMediaItemFromTrackData(trackData)
+                }
+                
+                Timber.tag("RNTP-AA").d("Converted ${mediaItems.size} tracks to MediaItems for searchId: $searchId")
+                
+                // Send results on main thread
+                withContext(Dispatchers.Main) {
+                    result.sendResult(mediaItems)
+                }
+            } catch (e: Exception) {
+                Timber.tag("RNTP-AA").e(e, "Error converting search results for searchId: $searchId")
+                // This invokes onError() on the search callback
+                withContext(Dispatchers.Main) {
+                    result.sendResult(null)
+                }
+            }
+        }
+    }
+    
+    /**
+     * Creates a MediaItem from track metadata provided by React Native
+     * @param trackData Map containing: mediaId, title, artist?, album?, artwork?, url?, duration?
+     * Note: url and duration are received but not used in MediaDescriptionCompat (they're playback properties)
+     */
+    private fun createMediaItemFromTrackData(trackData: Map<String, String?>): MediaItem? {
+        try {
+            val mediaId = trackData["mediaId"] ?: return null
+            val title = trackData["title"] ?: mediaId
+            val artist = trackData["artist"]
+            val album = trackData["album"]
+            val artwork = trackData["artwork"]
+            
+            val descriptionBuilder = MediaDescriptionCompat.Builder()
+                .setMediaId(mediaId)
+                .setTitle(title)
+            
+            artist?.let { descriptionBuilder.setSubtitle(it) }
+            album?.let { descriptionBuilder.setDescription(it) }
+            artwork?.let { 
+                try {
+                    val uri = android.net.Uri.parse(it)
+                    val finalArtworkUri = when {
+                        uri.scheme == "file" -> {
+                            // Convert file:// to content://
+                            val convertedArtworkUri = UriUtils.convertFileUriToContentUri(this, it)
+                            if (convertedArtworkUri != null) {
+                                android.net.Uri.parse(convertedArtworkUri)
+                            } else {
+                                Timber.tag("RNTP-AA").w("createMediaItemFromTrackData: Failed to convert file:// URI, using original: $it")
+                                uri
+                            }
+                        }
+                        uri.scheme == "http" || uri.scheme == "https" -> {
+                            // For HTTPS URLs, try to find cached version and convert to content://
+                            // Android Auto requires content:// URIs for artwork, not HTTP/HTTPS
+                            val cachedUri = UriUtils.convertHttpUriToContentUri(this, it)
+                            if (cachedUri != null) {
+                                android.net.Uri.parse(cachedUri)
+                            } else {
+                                Timber.tag("RNTP-AA").w("createMediaItemFromTrackData: HTTPS URL not cached locally - Android Auto may not display this artwork: $it")
+                                Timber.tag("RNTP-AA").w("Consider downloading and caching images before setting artwork for tracks")
+                                uri // Fallback to HTTPS URL (may not work in Android Auto)
+                            }
+                        }
+                        else -> uri
+                    }
+                    descriptionBuilder.setIconUri(finalArtworkUri)
+                } catch (e: Exception) {
+                    Timber.tag("RNTP-AA").w(e, "Invalid artwork URI: $it")
+                }
+            }
+            
+            val description = descriptionBuilder.build()
+            return MediaItem(description, MediaItem.FLAG_PLAYABLE)
+        } catch (e: Exception) {
+            Timber.tag("RNTP-AA").e(e, "Error creating MediaItem from track data: $trackData")
+            return null
+        }
+    }
+    
+    /**
+     * Creates a MediaItem from a media ID (format: "track/{bookId}/{contentId}")
+     * Returns null if the media ID cannot be parsed or metadata cannot be retrieved
+     * 
+     * NOTE: This method is deprecated - use createMediaItemFromTrackData instead
+     * which receives full metadata from React Native.
+     */
+    @Deprecated("Use createMediaItemFromTrackData instead")
+    private fun createMediaItemFromMediaId(mediaId: String): MediaItem? {
+        try {
+            val description = MediaDescriptionCompat.Builder()
+                .setMediaId(mediaId)
+                .setTitle(mediaId) // Temporary: use mediaId as title
+                .build()
+            
+            return MediaItem(description, MediaItem.FLAG_PLAYABLE)
+        } catch (e: Exception) {
+            Timber.tag("RNTP-AA").e(e, "Error creating MediaItem from media ID: $mediaId")
+            return null
+        }
     }
 
     enum class AppKilledPlaybackBehavior(val string: String) {
@@ -306,7 +499,7 @@ class MusicService : HeadlessJsMediaService(), AudioManager.OnAudioFocusChangeLi
         val automaticallyUpdateNotificationMetadata = playerOptions?.getBoolean(AUTO_UPDATE_METADATA, true) ?: true
         val mediaSessionCallback = object: AAMediaSessionCallBack {
             override fun handlePlayFromMediaId(mediaId: String?, extras: Bundle?) {
-                Timber.tag("GVA-RNTP").d("RNTP received req to play from mediaID: %s", mediaId)
+                Timber.tag("GVA-RNTP").d("RNTP received req to play from mediaID: $mediaId")
                 if (mediaId.isNullOrEmpty()) {
                     // Invalid media ID - set error state
                     player?.setPlaybackStateError(
@@ -321,7 +514,7 @@ class MusicService : HeadlessJsMediaService(), AudioManager.OnAudioFocusChangeLi
             }
 
             override fun handlePlayFromSearch(query: String?, extras: Bundle?) {
-                Timber.tag("GVA-RNTP").d("RNTP received req to play from query: %s, extras: %s", query, extras)
+                Timber.tag("GVA-RNTP").d("RNTP received req to play from query: $query, extras: $extras")
                 
                 // Extract search parameters to check if query is valid
                 val searchQuery = query ?: ""
@@ -359,7 +552,7 @@ class MusicService : HeadlessJsMediaService(), AudioManager.OnAudioFocusChangeLi
             }
             
             override fun handlePrepareFromMediaId(mediaId: String?, extras: Bundle?) {
-                Timber.tag("GVA-RNTP").d("RNTP received req to prepare from mediaID: %s", mediaId)
+                Timber.tag("GVA-RNTP").d("RNTP received req to prepare from mediaID: $mediaId")
                 if (mediaId.isNullOrEmpty()) {
                     // Invalid media ID - set error state
                     player?.setPlaybackStateError(
@@ -375,7 +568,7 @@ class MusicService : HeadlessJsMediaService(), AudioManager.OnAudioFocusChangeLi
             }
 
             override fun handlePrepareFromSearch(query: String?, extras: Bundle?) {
-                Timber.tag("GVA-RNTP").d("RNTP received req to prepare from query: %s, extras: %s", query, extras)
+                Timber.tag("GVA-RNTP").d("RNTP received req to prepare from query: $query, extras: $extras")
                 val searchBundle = Bundle().apply {
                     putString("query", query ?: "")
                     putBoolean("playWhenReady", false) // PREPARE always means prepare without playing
@@ -401,7 +594,7 @@ class MusicService : HeadlessJsMediaService(), AudioManager.OnAudioFocusChangeLi
             }
 
             override fun handleSkipToQueueItem(id: Long) {
-                Timber.tag("GVA-RNTP").d("RNTP received req to play from queue index: %d", id)
+                Timber.tag("GVA-RNTP").d("RNTP received req to play from queue index: $id")
                 val skipBundle = Bundle().apply {
                     putInt("index", id.toInt())
                 }
@@ -1048,6 +1241,18 @@ class MusicService : HeadlessJsMediaService(), AudioManager.OnAudioFocusChangeLi
         }
 
         progressUpdateJob?.cancel()
+        
+        // Clean up any pending search results to prevent memory leaks
+        pendingSearchResults.values.forEach { result ->
+            try {
+                result.sendResult(emptyList())
+            } catch (e: Exception) {
+                Timber.tag("RNTP-AA").w(e, "Error cleaning up search result")
+            }
+        }
+        pendingSearchResults.clear()
+        
+        MusicService.setInstance(null)
     }
 
     @MainThread
@@ -1096,6 +1301,16 @@ class MusicService : HeadlessJsMediaService(), AudioManager.OnAudioFocusChangeLi
 
         const val DEFAULT_JUMP_INTERVAL = 15.0
         const val DEFAULT_STOP_FOREGROUND_GRACE_PERIOD = 5
+        
+        // Static reference to MusicService instance for external access
+        @Volatile
+        private var instance: MusicService? = null
+        
+        fun getInstance(): MusicService? = instance
+        
+        fun setInstance(service: MusicService?) {
+            instance = service
+        }
     }
 
     private fun parseCapabilities(capabilityStrings: ArrayList<String>?): List<Capability> {
