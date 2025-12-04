@@ -36,10 +36,11 @@ dependencies {
     
     // KotlinAudio from JitPack (GitHub)
     // Using specific commit hash for reproducibility (build is ready on JitPack)
-    // Commit: 7ecd25350054af4c29b41ad77c63043736f90c08 (Android Auto artwork URI support with synchronous file loading)
+    // Commit: 79afe77 (fix: Resolve smart cast issue with artwork property in NotificationManager)
+    // Previous: 7ecd253 (Android Auto artwork URI support with synchronous file loading)
     // Branch: aa23-media-session-fixes-from-dev-aa
     // For latest from branch: 'com.github.losikov:KotlinAudio:aa23-media-session-fixes-from-dev-aa-SNAPSHOT'
-    implementation 'com.github.losikov:KotlinAudio:7ecd253'
+    implementation 'com.github.losikov:KotlinAudio:79afe77'
     
     implementation "androidx.core:core-ktx:1.9.0"
     implementation "androidx.localbroadcastmanager:localbroadcastmanager:1.1.0"
