@@ -2,10 +2,12 @@ import { Platform } from 'react-native';
 
 // Import the TurboModule directly
 import NativeTrackPlayer from '../js/NativeRTNTrackPlayer';
+import type { Spec } from '../js/NativeRTNTrackPlayer';
 
 // Export the TurboModule as the default export
 // This includes all methods AND all event emitters
-export default NativeTrackPlayer;
+// Explicitly type as Spec to ensure TypeScript recognizes all methods including sendSearchResults
+export default NativeTrackPlayer as Spec;
 
 // Re-export all hooks
 export * from './hooks';
@@ -28,6 +30,8 @@ export type {
   PlaybackQueueEndedEvent,
   PlaybackErrorEvent,
   PlaybackActiveTrackChangedEvent,
+  // Export Spec type so consumers can use it for type assertions if needed
+  Spec,
 } from '../js/NativeRTNTrackPlayer';
 
 export {

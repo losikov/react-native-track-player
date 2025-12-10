@@ -74,12 +74,26 @@ class TrackPlayerModule(
             if (!::musicService.isInitialized) {
                 val binder: MusicService.MusicBinder = service as MusicService.MusicBinder
                 musicService = binder.service
-                Timber.d("🎵 TrackPlayerModule setting up player with options")
-                musicService.setupPlayer(playerOptions)
                 
-                // Set this TurboModule as the event listener - clean architecture!
+                // Set this TurboModule as the event listener FIRST (before setupPlayer)
+                // This allows browse tree to be set even if setupPlayer() fails (e.g., app in background)
                 Timber.d("🎵 TrackPlayerModule setting event listener")
                 musicService.trackPlayerModule = this@TrackPlayerModule
+                
+                // Try to setup player, but don't fail if it can't (e.g., app in background for Android Auto)
+                try {
+                    Timber.d("🎵 TrackPlayerModule setting up player with options")
+                    musicService.setupPlayer(playerOptions)
+                } catch (e: Exception) {
+                    Timber.w(e, "🎵 TrackPlayerModule setupPlayer() failed (may be in background for Android Auto)")
+                    // Continue anyway - browse tree can still be set
+                }
+                
+                // Send pending browse results if React Native was initialized for Android Auto
+                musicService.sendPendingBrowseResults()
+                // Process pending search requests that were queued before TrackPlayerModule was ready
+                Timber.tag("RNTP-AA").d("TrackPlayerModule bound, processing pending search requests")
+                musicService.processPendingSearchRequests()
                 
                 Timber.d("🎵 TrackPlayerModule resolving setup promise")
                 playerSetUpPromise?.resolve(null)
@@ -130,12 +144,29 @@ class TrackPlayerModule(
                 return@launch
             }
 
+            // Bind service FIRST, even if setupPlayer() will fail due to background check
+            // This allows browse tree to be set even when app is in background (e.g., Android Auto)
+            val isBackgrounded = Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && AppForegroundTracker.backgrounded
+            
+            // Always bind service early to ensure TrackPlayerModule connects even if setupPlayer() fails
+            Intent(context, MusicService::class.java).also { intent ->
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    context.startForegroundService(intent)
+                } else {
+                    context.startService(intent)
+                }
+                @Suppress("DEPRECATION")
+                context.bindService(intent, this@TrackPlayerModule, Context.BIND_AUTO_CREATE)
+            }
+
             // prevent crash Fatal Exception: android.app.RemoteServiceException$ForegroundServiceDidNotStartInTimeException
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && AppForegroundTracker.backgrounded) {
+            if (isBackgrounded) {
                 promise.reject(
                     "android_cannot_setup_player_in_background",
                     "On Android the app must be in the foreground when setting up the player."
                 )
+                // Service binding was initiated above - onServiceConnected() will be called
+                // and trackPlayerModule will be set, allowing browse tree to work
                 return@launch
             }
 
@@ -194,27 +225,9 @@ class TrackPlayerModule(
                 IntentFilter(EVENT_INTENT)
             )
 
-            Intent(context, MusicService::class.java).also { intent ->
-                Timber.d("🎵 TrackPlayerModule starting MusicService")
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                    context.startForegroundService(intent)
-                } else {
-                    context.startService(intent)
-                }
-                @Suppress("DEPRECATION")
-                val bindResult = context.bindService(
-                    intent,
-                    this@TrackPlayerModule,
-                    1 // Context.BIND_AUTO_CREATE = 1
-                )
-                Timber.d("🎵 TrackPlayerModule bindService result: $bindResult")
-                
-                // Wait for service to be bound before resolving
-                if (!bindResult) {
-                    promise.reject("service_bind_failed", "Failed to bind to MusicService")
-                    return@launch
-                }
-            }
+            // Service binding was already done above (before foreground check)
+            // If we're here, app is in foreground, so we can continue with setupPlayer()
+            // The service binding initiated above will complete via onServiceConnected()
         }
     }
 
@@ -962,9 +975,46 @@ class TrackPlayerModule(
     override fun setBrowseTree(tree: ReadableMap, promise: Promise) {
         Timber.d("🎵 TurboModule setBrowseTree() called")
         scope.launch {
-            if (verifyServiceBoundOrReject(promise)) {
-                return@launch
+            // Allow setBrowseTree() even if service isn't bound yet (for Android Auto background initialization)
+            // We can still set the browse tree on MusicService directly
+            if (!isServiceBound) {
+                Timber.w("setBrowseTree() called but service not bound yet - using MusicService.getInstance()")
+                
+                // Try to get MusicService instance directly
+                val musicServiceInstance = com.doublesymmetry.trackplayer.service.MusicService.getInstance()
+                if (musicServiceInstance == null) {
+                    Timber.e("setBrowseTree() - MusicService instance is null, rejecting")
+                    promise.reject(
+                        "service_not_available",
+                        "MusicService is not available. Please wait for service to initialize."
+                    )
+                    return@launch
+                }
+                
+                // Set browse tree directly on MusicService instance
+                try {
+                    val mediaItemsMap = tree.toHashMap()
+                    musicServiceInstance.mediaTree = mediaItemsMap.mapValues { entry ->
+                        val rawItems = entry.value as ArrayList<HashMap<String, String>>
+                        readableArrayToMediaItems(rawItems)
+                    }
+                    Timber.d("Browse tree set directly on MusicService (service not bound)")
+                    mediaItemsMap.keys.forEach {
+                        musicServiceInstance.notifyChildrenChanged(it)
+                    }
+                    
+                    // Send pending browse results
+                    musicServiceInstance.sendPendingBrowseResults()
+                    
+                    promise.resolve(musicServiceInstance.mediaTree.toString())
+                    return@launch
+                } catch (exception: Exception) {
+                    Timber.e(exception, "setBrowseTree error")
+                    promise.reject("runtime_exception", exception.message, exception)
+                    return@launch
+                }
             }
+            
             try {
                 val mediaItemsMap = tree.toHashMap()
                 
@@ -976,6 +1026,10 @@ class TrackPlayerModule(
                 mediaItemsMap.keys.forEach {
                     musicService.notifyChildrenChanged(it)
                 }
+                
+                // Send pending browse results now that browse tree is populated
+                musicService.sendPendingBrowseResults()
+                
                 promise.resolve(musicService.mediaTree.toString())
             } catch (exception: Exception) {
                 Timber.tag("RNTP-AA").e(exception, "setBrowseTree error")
@@ -1227,9 +1281,15 @@ class TrackPlayerModule(
     }
     
     override fun onRemotePlayFromSearch(data: Bundle) {
-        Timber.d("🎵 TrackPlayerModule.onRemotePlayFromSearch")
+        val query = data.getString("query") ?: ""
+        Timber.tag("GVA-RNTP").d("TrackPlayerModule.onRemotePlayFromSearch called with query: '$query'")
         scope.launch {
-            emitOnRemotePlayFromSearch(Arguments.fromBundle(data))
+            try {
+                emitOnRemotePlayFromSearch(Arguments.fromBundle(data))
+                Timber.tag("GVA-RNTP").d("TrackPlayerModule.onRemotePlayFromSearch event emitted successfully")
+            } catch (e: Exception) {
+                Timber.tag("GVA-RNTP").e(e, "Error emitting onRemotePlayFromSearch")
+            }
         }
     }
     
@@ -1241,9 +1301,15 @@ class TrackPlayerModule(
     }
     
     override fun onRemotePrepareFromSearch(data: Bundle) {
-        Timber.d("🎵 TrackPlayerModule.onRemotePrepareFromSearch")
+        val query = data.getString("query") ?: ""
+        Timber.tag("GVA-RNTP").d("TrackPlayerModule.onRemotePrepareFromSearch called with query: '$query'")
         scope.launch {
-            emitOnRemotePrepareFromSearch(Arguments.fromBundle(data))
+            try {
+                emitOnRemotePrepareFromSearch(Arguments.fromBundle(data))
+                Timber.tag("GVA-RNTP").d("TrackPlayerModule.onRemotePrepareFromSearch event emitted successfully")
+            } catch (e: Exception) {
+                Timber.tag("GVA-RNTP").e(e, "Error emitting onRemotePrepareFromSearch")
+            }
         }
     }
     
@@ -1299,7 +1365,7 @@ class TrackPlayerModule(
      * @param results Array of track objects with metadata: { mediaId, title, artist?, album?, artwork? }
      */
     override fun sendSearchResults(searchId: String, results: ReadableArray, promise: Promise) {
-        Timber.tag("TrackPlayerModule").d("sendSearchResults called with searchId: $searchId, count: ${results.size()}")
+        Timber.tag("RNTP-AA").d("sendSearchResults called with searchId: $searchId, count: ${results.size()}")
         scope.launch {
             if (verifyServiceBoundOrReject(promise)) return@launch
             try {
@@ -1323,7 +1389,7 @@ class TrackPlayerModule(
                 musicService.sendSearchResults(searchId, trackResults)
                 promise.resolve(null)
             } catch (e: Exception) {
-                Timber.tag("TrackPlayerModule").e(e, "Error in sendSearchResults")
+                Timber.tag("RNTP-AA").e(e, "Error in sendSearchResults")
                 promise.reject("error_sending_search_results", e.message ?: "Unknown error", e)
             }
         }

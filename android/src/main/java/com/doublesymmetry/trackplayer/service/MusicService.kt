@@ -113,6 +113,18 @@ class MusicService : HeadlessJsMediaService(), AudioManager.OnAudioFocusChangeLi
     // Search result callbacks - map search ID to Result callback
     private val pendingSearchResults = mutableMapOf<String, Result<List<MediaItem>>>()
     private var searchIdCounter = 0
+    
+    // Pending search requests - queue search requests when TrackPlayerModule isn't ready yet
+    private data class PendingSearchRequest(
+        val query: String,
+        val extras: Bundle?,
+        val result: Result<List<MediaItem>>
+    )
+    private val pendingSearchRequests = mutableListOf<PendingSearchRequest>()
+    
+    // Browse result callbacks - map mediaId to Result callback (for lazy initialization)
+    private val pendingBrowseResults = mutableMapOf<String, Result<List<MediaItem>>>()
+    private var isInitializingReactNative = false
 
     @ExperimentalCoroutinesApi
     override fun onCreate() {
@@ -188,6 +200,13 @@ class MusicService : HeadlessJsMediaService(), AudioManager.OnAudioFocusChangeLi
         
         val browserRoot = BrowserRoot(rootId, extras)
 
+        // Initialize React Native if not already initialized and browse tree is empty
+        // This ensures Android Auto can discover content even when app hasn't been launched
+        if (trackPlayerModule == null && mediaTree.isEmpty() && !isInitializingReactNative) {
+            isInitializingReactNative = true
+            initializeReactNativeForAndroidAuto()
+        }
+
         // MediaBrowserService should NEVER launch an Activity (per Google Assistant guidelines)
         // The MediaSession is created inside the service (via QueuedAudioPlayer) and is independent
         // of the activity lifecycle. Assistant will launch Activity based on PendingIntent from
@@ -212,10 +231,178 @@ class MusicService : HeadlessJsMediaService(), AudioManager.OnAudioFocusChangeLi
     ) {
         Timber.tag("GVA-RNTP").d("RNTP received loadChildren req: $parentMediaId")
         
+        // Check if React Native is initialized and browse tree has content
+        val hasContent = mediaTree[parentMediaId] != null && mediaTree[parentMediaId]!!.isNotEmpty()
+        
+        if (trackPlayerModule == null || !hasContent) {
+            // Detach result - we'll send it later when React Native is ready
+            result.detach()
+            pendingBrowseResults[parentMediaId] = result
+            
+            // Initialize React Native if not already initializing
+            if (!isInitializingReactNative && trackPlayerModule == null) {
+                isInitializingReactNative = true
+                initializeReactNativeForAndroidAuto()
+            }
+            
+            return
+        }
+        
+        // React Native is initialized and we have content - proceed normally
         trackPlayerModule?.onRemoteBrowse(Bundle().apply {
             putString("mediaId", parentMediaId)
         })
-        result.sendResult(mediaTree[parentMediaId])
+        
+        val contentToReturn = mediaTree[parentMediaId] ?: emptyList()
+        result.sendResult(contentToReturn)
+    }
+    
+    /**
+     * Mark that React Native was initialized by MusicService so MainApplication can skip duplicate initialization.
+     * Uses reflection to find MainApplication class dynamically (works for any app package name).
+     */
+    private fun markReactNativeInitializedByMusicService() {
+        try {
+            val applicationClass = application.javaClass
+            val packageName = applicationClass.`package`?.name
+            if (packageName != null) {
+                // Try common MainApplication class name patterns
+                val mainAppClassNames = listOf(
+                    "$packageName.MainApplication",
+                    "${packageName}.app.MainApplication"
+                )
+                for (className in mainAppClassNames) {
+                    try {
+                        val mainAppClass = Class.forName(className)
+                        val markMethod = mainAppClass.getMethod("markReactNativeInitializedByMusicService")
+                        markMethod.invoke(null)
+                        Timber.tag("RNTP-AA").d("Marked React Native as initialized via $className")
+                        return
+                    } catch (e: ClassNotFoundException) {
+                        // Try next pattern
+                        continue
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            // MainApplication not found or method doesn't exist - that's OK, will check context directly
+            Timber.tag("RNTP-AA").d("Could not mark React Native as initialized: ${e.message}")
+        }
+    }
+    
+    /**
+     * Initialize React Native context for Android Auto.
+     * This uses HeadlessJsMediaService's mechanism to create React context in background.
+     */
+    private fun initializeReactNativeForAndroidAuto() {
+        Timber.tag("RNTP-AA").d("initializeReactNativeForAndroidAuto called")
+        try {
+            val reactInstanceManager = (application as? com.facebook.react.ReactApplication)
+                ?.reactNativeHost?.reactInstanceManager
+            
+            if (reactInstanceManager == null) {
+                Timber.tag("RNTP-AA").e("ReactInstanceManager is null!")
+                isInitializingReactNative = false
+                return
+            }
+            
+            val reactContext = reactInstanceManager.currentReactContext
+            
+            if (reactContext != null) {
+                Timber.tag("RNTP-AA").d("React Native context already exists, marking as initialized")
+                isInitializingReactNative = false
+                // React Native is already initialized, but trackPlayerModule might not be set yet
+                // It will be set when TrackPlayerModule binds, which will trigger sendPendingBrowseResults()
+                markReactNativeInitializedByMusicService()
+                return
+            }
+            
+            Timber.tag("RNTP-AA").d("React Native context not found, creating in background")
+            // React Native not initialized - create context in background
+            reactInstanceManager.addReactInstanceEventListener(
+                object : com.facebook.react.ReactInstanceManager.ReactInstanceEventListener {
+                    override fun onReactContextInitialized(reactContext: com.facebook.react.bridge.ReactContext) {
+                        reactInstanceManager.removeReactInstanceEventListener(this)
+                        isInitializingReactNative = false
+                        Timber.tag("RNTP-AA").d("React Native context initialized, marking and scheduling pending requests")
+                        markReactNativeInitializedByMusicService()
+                        // TrackPlayerModule will connect and set trackPlayerModule, which will trigger sendPendingBrowseResults()
+                        // Give it a moment for TrackPlayerModule to bind
+                        android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
+                            if (trackPlayerModule != null) {
+                                Timber.tag("RNTP-AA").d("TrackPlayerModule available after RN init, processing pending requests")
+                                sendPendingBrowseResults()
+                                processPendingSearchRequests()
+                            } else {
+                                Timber.tag("RNTP-AA").w("TrackPlayerModule still null after RN init delay")
+                            }
+                        }, 1000) // Wait 1 second for TrackPlayerModule to bind
+                    }
+                }
+            )
+            
+            // Also listen for initialization failures
+            try {
+                reactInstanceManager.createReactContextInBackground()
+                Timber.tag("RNTP-AA").d("Started creating React Native context in background")
+            } catch (e: Exception) {
+                Timber.tag("RNTP-AA").e(e, "Failed to create React context")
+                isInitializingReactNative = false
+            }
+        } catch (e: Exception) {
+            Timber.tag("RNTP-AA").e(e, "Error initializing React Native for Android Auto")
+            isInitializingReactNative = false
+        }
+    }
+    
+    /**
+     * Send pending browse results when browse tree is populated.
+     * Called from setBrowseTree() or when trackPlayerModule is set.
+     */
+    fun sendPendingBrowseResults() {
+        if (pendingBrowseResults.isEmpty()) {
+            Timber.tag("RNTP-AA").d("No pending browse results to send")
+            return
+        }
+        
+        Timber.tag("RNTP-AA").d("Sending ${pendingBrowseResults.size} pending browse results")
+        val resultsToSend = pendingBrowseResults.toMap()
+        pendingBrowseResults.clear()
+        
+        resultsToSend.forEach { (parentMediaId, result) ->
+            val content = mediaTree[parentMediaId] ?: emptyList()
+            
+            // Notify React Native about the browse request
+            trackPlayerModule?.onRemoteBrowse(Bundle().apply {
+                putString("mediaId", parentMediaId)
+            })
+            
+            result.sendResult(content)
+        }
+    }
+    
+    /**
+     * Process pending search requests that were queued before TrackPlayerModule was ready
+     */
+    fun processPendingSearchRequests() {
+        if (pendingSearchRequests.isEmpty()) {
+            Timber.tag("RNTP-AA").d("No pending search requests to process")
+            return
+        }
+        
+        if (trackPlayerModule == null) {
+            Timber.tag("RNTP-AA").w("Cannot process pending search requests: TrackPlayerModule is null")
+            return
+        }
+        
+        val requestsToProcess = pendingSearchRequests.toList()
+        pendingSearchRequests.clear()
+        
+        Timber.tag("RNTP-AA").d("Processing ${requestsToProcess.size} pending search requests")
+        requestsToProcess.forEach { request ->
+            Timber.tag("RNTP-AA").d("Processing queued search: query='${request.query}'")
+            processSearchRequest(request.query, request.extras, request.result)
+        }
     }
 
     override fun onSearch(
@@ -228,6 +415,33 @@ class MusicService : HeadlessJsMediaService(), AudioManager.OnAudioFocusChangeLi
         // Detach from result to unblock the caller (search can be expensive)
         result.detach()
         
+        // Check if TrackPlayerModule is ready
+        val module = trackPlayerModule
+        if (module == null) {
+            Timber.tag("RNTP-AA").w("TrackPlayerModule is null, queueing search request: query='$query'")
+            // Queue the search request to be processed when TrackPlayerModule binds
+            pendingSearchRequests.add(PendingSearchRequest(query, extras, result))
+            
+            // Initialize React Native if not already initializing
+            if (!isInitializingReactNative) {
+                isInitializingReactNative = true
+                initializeReactNativeForAndroidAuto()
+            }
+            return
+        }
+        
+        // TrackPlayerModule is ready - process search immediately
+        processSearchRequest(query, extras, result)
+    }
+    
+    /**
+     * Process a search request by calling React Native
+     */
+    private fun processSearchRequest(
+            query: String,
+            extras: Bundle?,
+            result: Result<List<MediaItem>>
+    ) {
         // Generate unique search ID
         val searchId = "search_${++searchIdCounter}_${System.currentTimeMillis()}"
         
@@ -248,16 +462,16 @@ class MusicService : HeadlessJsMediaService(), AudioManager.OnAudioFocusChangeLi
             albumName?.let { putString("albumName", it) }
         }
         
-        Timber.tag("RNTP-AA").d("Calling React Native for search: searchId=$searchId, query='$query'")
+        Timber.tag("RNTP-AA").d("Calling React Native for search: searchId=$searchId, query='$query', artistName=$artistName, albumName=$albumName")
         val module = trackPlayerModule
         if (module == null) {
-            Timber.tag("RNTP-AA").w("TrackPlayerModule is null, cannot perform search")
+            Timber.tag("RNTP-AA").e("TrackPlayerModule is null, cannot process search request")
             result.sendResult(emptyList())
             pendingSearchResults.remove(searchId)
             return
         }
-        module.onRemoteSearch(searchBundle)
         
+        module.onRemoteSearch(searchBundle)
         // Note: Results will be returned via sendSearchResults() method
     }
     
@@ -422,7 +636,10 @@ class MusicService : HeadlessJsMediaService(), AudioManager.OnAudioFocusChangeLi
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         // TurboModule: Only start headless task if config is provided (null for New Architecture)
-        getTaskConfig(intent)?.let { startTask(it) }
+        val taskConfig = getTaskConfig(intent)
+        if (taskConfig != null) {
+            startTask(taskConfig)
+        }
         startAndStopEmptyNotificationToAvoidANR()
         return START_STICKY
     }
@@ -470,7 +687,7 @@ class MusicService : HeadlessJsMediaService(), AudioManager.OnAudioFocusChangeLi
     @MainThread
     fun setupPlayer(playerOptions: Bundle?) {
         if (this::player.isInitialized) {
-            print("Player was initialized. Prevent re-initializing again")
+            Timber.d("Player was initialized. Prevent re-initializing again")
             return
         }
 
@@ -548,7 +765,33 @@ class MusicService : HeadlessJsMediaService(), AudioManager.OnAudioFocusChangeLi
                         }
                     }
                 }
-                trackPlayerModule?.onRemotePlayFromSearch(searchBundle)
+                
+                // Check if TrackPlayerModule is ready
+                val module = trackPlayerModule
+                if (module == null) {
+                    Timber.tag("GVA-RNTP").w("TrackPlayerModule is null, cannot handle play from search. Initializing React Native...")
+                    // Initialize React Native if not already initializing
+                    if (!isInitializingReactNative) {
+                        isInitializingReactNative = true
+                        initializeReactNativeForAndroidAuto()
+                    }
+                    // Wait for TrackPlayerModule to bind, then retry
+                    // Use a delayed handler to retry after React Native initializes
+                    android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
+                        if (trackPlayerModule != null) {
+                            Timber.tag("GVA-RNTP").d("TrackPlayerModule now available, retrying play from search")
+                            trackPlayerModule?.onRemotePlayFromSearch(searchBundle)
+                        } else {
+                            Timber.tag("GVA-RNTP").e("TrackPlayerModule still null after initialization delay, play from search may fail")
+                            // Try anyway - React Native might handle it gracefully
+                            trackPlayerModule?.onRemotePlayFromSearch(searchBundle)
+                        }
+                    }, 2000) // Wait 2 seconds for TrackPlayerModule to bind
+                    return
+                }
+                
+                Timber.tag("GVA-RNTP").d("Calling TrackPlayerModule.onRemotePlayFromSearch with query: '$searchQuery'")
+                module.onRemotePlayFromSearch(searchBundle)
             }
             
             override fun handlePrepareFromMediaId(mediaId: String?, extras: Bundle?) {
@@ -590,7 +833,31 @@ class MusicService : HeadlessJsMediaService(), AudioManager.OnAudioFocusChangeLi
                         }
                     }
                 }
-                trackPlayerModule?.onRemotePrepareFromSearch(searchBundle)
+                
+                // Check if TrackPlayerModule is ready
+                val module = trackPlayerModule
+                if (module == null) {
+                    Timber.tag("GVA-RNTP").w("TrackPlayerModule is null, cannot handle prepare from search. Initializing React Native...")
+                    // Initialize React Native if not already initializing
+                    if (!isInitializingReactNative) {
+                        isInitializingReactNative = true
+                        initializeReactNativeForAndroidAuto()
+                    }
+                    // Wait for TrackPlayerModule to bind, then retry
+                    android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
+                        if (trackPlayerModule != null) {
+                            Timber.tag("GVA-RNTP").d("TrackPlayerModule now available, retrying prepare from search")
+                            trackPlayerModule?.onRemotePrepareFromSearch(searchBundle)
+                        } else {
+                            Timber.tag("GVA-RNTP").e("TrackPlayerModule still null after initialization delay, prepare from search may fail")
+                            trackPlayerModule?.onRemotePrepareFromSearch(searchBundle)
+                        }
+                    }, 2000) // Wait 2 seconds for TrackPlayerModule to bind
+                    return
+                }
+                
+                Timber.tag("GVA-RNTP").d("Calling TrackPlayerModule.onRemotePrepareFromSearch with query: '${query ?: ""}'")
+                module.onRemotePrepareFromSearch(searchBundle)
             }
 
             override fun handleSkipToQueueItem(id: Long) {

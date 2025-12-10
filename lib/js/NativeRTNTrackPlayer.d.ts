@@ -276,6 +276,15 @@ export interface Spec extends TurboModule {
     updateOptions(options: UpdateOptions): Promise<void>;
     destroy(): Promise<void>;
     setPlaybackStateError(errorCode: number, errorMessage: string): Promise<void>;
+    sendSearchResults(searchId: string, results: Array<{
+        mediaId: string;
+        title: string;
+        artist?: string;
+        album?: string;
+        artwork?: string;
+        url?: string;
+        duration?: number;
+    }>): Promise<void>;
     readonly onPlaybackState: EventEmitter<{
         state: PlaybackState;
         error?: PlaybackErrorEvent;
