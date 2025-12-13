@@ -1274,7 +1274,6 @@ class TrackPlayerModule(
     }
     
     override fun onRemoteBrowse(data: Bundle) {
-        Timber.d("🎵 TrackPlayerModule.onRemoteBrowse")
         scope.launch {
             emitOnRemoteBrowse(Arguments.fromBundle(data))
         }

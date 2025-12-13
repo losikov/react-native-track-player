@@ -147,22 +147,25 @@ class MusicService : HeadlessJsMediaService(), AudioManager.OnAudioFocusChangeLi
             clientUid: Int,
             rootHints: Bundle?
     ): BrowserRoot {
-        Timber.tag("RNTP-AA").d("$clientPackageName (uid=$clientUid) attempted to get Browsable root.")
-        
-        // Log root hints to debug image quality issues
-        if (rootHints != null) {
-            Timber.tag("RNTP-AA").d("Root hints keys: ${rootHints.keySet()}")
-            for (key in rootHints.keySet()) {
-                val value = rootHints.get(key)
-                Timber.tag("RNTP-AA").d("Root hint: $key = $value (type: ${value?.javaClass?.simpleName})")
+        // Detect Android Auto connection and ensure audio routing when playback is active
+        if (clientPackageName == "com.google.android.projection.gearhead") {
+            scope.launch {
+                kotlinx.coroutines.delay(500)
+                if (::player.isInitialized && player.isPlaying) {
+                    // Force audio session re-initialization to route audio to Android Auto
+                    // This is necessary because ExoPlayer 2.x doesn't automatically re-route
+                    // audio when Android Auto connects while playback is active
+                    player.ensureAudioSessionInitialized()
+                }
             }
-            // Check for media art size hint (Android Auto tells us what size images it expects)
+        }
+        
+        // Log root hints for debugging
+        if (rootHints != null) {
             val artSizeHint = rootHints.getInt("android.media.browse.EXTRA_MEDIA_ART_SIZE_HINT_PIXELS", -1)
             if (artSizeHint > 0) {
                 Timber.tag("RNTP-AA").d("Android Auto requests images at size: ${artSizeHint}x${artSizeHint} pixels")
             }
-        } else {
-            Timber.tag("RNTP-AA").d("No root hints provided")
         }
 
         // CRITICAL: Always return a valid BrowserRoot for ALL clients FIRST (return quickly)
@@ -229,13 +232,13 @@ class MusicService : HeadlessJsMediaService(), AudioManager.OnAudioFocusChangeLi
             parentMediaId: String,
             result: Result<List<MediaItem>>
     ) {
-        Timber.tag("GVA-RNTP").d("RNTP received loadChildren req: $parentMediaId")
+        // Check if React Native is initialized and browse tree has the key
+        // Note: An empty list is valid content (means "no items"), we only detach if the key doesn't exist
+        val keyExists = mediaTree.containsKey(parentMediaId)
         
-        // Check if React Native is initialized and browse tree has content
-        val hasContent = mediaTree[parentMediaId] != null && mediaTree[parentMediaId]!!.isNotEmpty()
-        
-        if (trackPlayerModule == null || !hasContent) {
-            // Detach result - we'll send it later when React Native is ready
+        // Only detach if React Native isn't initialized OR the key doesn't exist in the tree yet
+        // If the key exists (even with empty list), we should return it immediately
+        if (trackPlayerModule == null || !keyExists) {
             result.detach()
             pendingBrowseResults[parentMediaId] = result
             
