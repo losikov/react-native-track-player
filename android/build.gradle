@@ -44,7 +44,7 @@ dependencies {
     // Previous: 79afe77 (fix: Resolve smart cast issue with artwork property in NotificationManager)
     // Branch: aa23-media-session-fixes-from-dev-aa
     // For latest from branch: 'com.github.losikov:KotlinAudio:aa23-media-session-fixes-from-dev-aa-SNAPSHOT'
-    implementation 'com.github.losikov:KotlinAudio:2c6300b'
+    implementation 'com.github.losikov:KotlinAudio:6387ad68'
     
     implementation "androidx.core:core-ktx:1.9.0"
     implementation "androidx.localbroadcastmanager:localbroadcastmanager:1.1.0"
