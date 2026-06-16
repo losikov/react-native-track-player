@@ -807,10 +807,9 @@ class TrackPlayerModule(
         scope.launch {
             if (verifyServiceBoundOrReject(promise)) return@launch
             try {
-                musicService.skip(index.toInt())
-                if (initialPosition != null && initialPosition >= 0) {
-                    musicService.seekTo(initialPosition.toFloat())
-                }
+                val initialPositionSeconds =
+                    if (initialPosition != null && initialPosition >= 0) initialPosition.toFloat() else null
+                musicService.skip(index.toInt(), initialPositionSeconds)
                 promise.resolve(null)
             } catch (exception: Exception) {
                 promise.reject("runtime_exception", exception.message, exception)

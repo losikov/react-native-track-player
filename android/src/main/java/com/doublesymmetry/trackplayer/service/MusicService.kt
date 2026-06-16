@@ -1104,8 +1104,13 @@ class MusicService : HeadlessJsMediaService(), AudioManager.OnAudioFocusChangeLi
     }
 
     @MainThread
-    fun skip(index: Int) {
+    fun skip(index: Int, initialPositionSeconds: Float? = null) {
         player.jumpToItem(index)
+        // jumpToItem already seeks to the start of the target item (TIME_UNSET).
+        // Only seek when resuming mid-track; a seekTo(0) after jump caused stale position on Android.
+        if (initialPositionSeconds != null && initialPositionSeconds > 0f) {
+            player.seek((initialPositionSeconds * 1000).toLong(), java.util.concurrent.TimeUnit.MILLISECONDS)
+        }
     }
 
     @MainThread
