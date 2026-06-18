@@ -34,17 +34,10 @@ repositories {
 dependencies {
     implementation 'com.facebook.react:react-native'
     
-    // KotlinAudio from local source (fork)
-    // Local project is defined in app's settings.gradle
-    // implementation project(':kotlin-audio')
-    
-    // KotlinAudio from JitPack (GitHub) - COMMENTED OUT, using local fork instead
-    // Using specific commit hash for reproducibility (build is ready on JitPack)
-    // Commit: 2c6300b (Fix Android Auto audio routing by re-initializing audio session on connect/disconnect)
-    // Previous: 79afe77 (fix: Resolve smart cast issue with artwork property in NotificationManager)
-    // Branch: aa23-media-session-fixes-from-dev-aa
-    // For latest from branch: 'com.github.losikov:KotlinAudio:aa23-media-session-fixes-from-dev-aa-SNAPSHOT'
-    implementation 'com.github.losikov:KotlinAudio:2c6300b'
+    // KotlinAudio from JitPack (losikov fork)
+    // Commit cb5f9d4: jumpToItem(index, positionMs) for mid-track restore on Android
+    // Previous: 2c6300b (Android Auto audio routing)
+    implementation 'com.github.losikov:KotlinAudio:cb5f9d4'
     
     implementation "androidx.core:core-ktx:1.9.0"
     implementation "androidx.localbroadcastmanager:localbroadcastmanager:1.1.0"

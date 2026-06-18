@@ -23,6 +23,7 @@ import androidx.media.utils.MediaConstants
 import com.doublesymmetry.kotlinaudio.models.*
 import com.doublesymmetry.kotlinaudio.models.NotificationButton.*
 import com.doublesymmetry.kotlinaudio.players.QueuedAudioPlayer
+import com.google.android.exoplayer2.C
 import com.doublesymmetry.trackplayer.HeadlessJsMediaService
 import com.doublesymmetry.trackplayer.extensions.NumberExt.Companion.toMilliseconds
 import com.doublesymmetry.trackplayer.extensions.NumberExt.Companion.toSeconds
@@ -1105,12 +1106,15 @@ class MusicService : HeadlessJsMediaService(), AudioManager.OnAudioFocusChangeLi
 
     @MainThread
     fun skip(index: Int, initialPositionSeconds: Float? = null) {
-        player.jumpToItem(index)
-        // jumpToItem already seeks to the start of the target item (TIME_UNSET).
-        // Only seek when resuming mid-track; a seekTo(0) after jump caused stale position on Android.
-        if (initialPositionSeconds != null && initialPositionSeconds > 0f) {
-            player.seek((initialPositionSeconds * 1000).toLong(), java.util.concurrent.TimeUnit.MILLISECONDS)
-        }
+        val positionMs =
+            if (initialPositionSeconds != null && initialPositionSeconds > 0f) {
+                (initialPositionSeconds * 1000).toLong()
+            } else {
+                C.TIME_UNSET
+            }
+        // Single seekTo(index, positionMs) — do not seek again after jumpToItem; ExoPlayer drops
+        // a follow-up seek when prepare() is still running (iOS seekTo-after-jump works synchronously).
+        player.jumpToItem(index, positionMs)
     }
 
     @MainThread
