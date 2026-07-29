@@ -36,8 +36,9 @@ dependencies {
     
     // KotlinAudio from JitPack (losikov fork)
     // Commit cb5f9d4: jumpToItem(index, positionMs) for mid-track restore on Android
+    // Use full SHA — JitPack returns tagNotFound for short hash cb5f9d4
     // Previous: 2c6300b (Android Auto audio routing)
-    implementation 'com.github.losikov:KotlinAudio:cb5f9d4'
+    implementation 'com.github.losikov:KotlinAudio:cb5f9d4ea0ad43cacbb449dc5f6570d8ba839d89'
     
     implementation "androidx.core:core-ktx:1.9.0"
     implementation "androidx.localbroadcastmanager:localbroadcastmanager:1.1.0"
