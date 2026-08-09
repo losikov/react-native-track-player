@@ -150,10 +150,22 @@ class TrackPlayerModule(
             
             // Always bind service early to ensure TrackPlayerModule connects even if setupPlayer() fails
             Intent(context, MusicService::class.java).also { intent ->
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                    context.startForegroundService(intent)
-                } else {
-                    context.startService(intent)
+                // Starting a foreground service from the background throws
+                // ForegroundServiceStartNotAllowedException on Android 12+. When backgrounded we only
+                // bind (BIND_AUTO_CREATE still creates the service), which is all Android Auto needs;
+                // the service promotes itself to the foreground once playback actually starts.
+                if (!isBackgrounded) {
+                    try {
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                            context.startForegroundService(intent)
+                        } else {
+                            context.startService(intent)
+                        }
+                    } catch (e: IllegalStateException) {
+                        // The process may have been backgrounded between the check above and this call,
+                        // or the app may be under a background-start restriction we can't observe.
+                        Timber.w(e, "🎵 Could not start MusicService in the foreground, binding only")
+                    }
                 }
                 @Suppress("DEPRECATION")
                 context.bindService(intent, this@TrackPlayerModule, Context.BIND_AUTO_CREATE)
