@@ -28,6 +28,7 @@ import com.facebook.react.bridge.*
 import com.google.android.exoplayer2.DefaultLoadControl.*
 import com.google.android.exoplayer2.Player
 import kotlinx.coroutines.MainScope
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import timber.log.Timber
@@ -57,6 +58,53 @@ class TrackPlayerModule(
     private var isServiceBound = false
     private var playerSetUpPromise: Promise? = null
     private val scope = MainScope()
+
+    /**
+     * Set once the React instance this module belongs to is going away — a Metro reload, a host
+     * destroy. Guarded by [emitLock] rather than only volatile: [invalidate] runs on the ReactHost's
+     * thread while emits run on Main, and the instance is destroyed the moment [invalidate] returns,
+     * so an emit that had already passed a plain flag check would still call into a dead runtime.
+     */
+    private var invalidated = false
+    private val emitLock = Any()
+
+    /**
+     * Every JS-bound event goes through here. `MusicService` is a started service that outlives the
+     * React instance: after a reload it kept calling the *old* module, whose codegen emitter is a
+     * `CxxCallbackImpl` into a runtime that no longer exists — the crash surfaced as
+     * `RuntimeException: __next_prime overflow` from `emitOnPlaybackProgressUpdated`.
+     */
+    private fun emit(block: () -> Unit) {
+        scope.launch {
+            synchronized(emitLock) {
+                if (invalidated || !reactContext.hasActiveReactInstance()) return@launch
+                block()
+            }
+        }
+    }
+
+    /**
+     * The React instance is being torn down. Detach from the service so it stops calling this
+     * module, drop the binding so the connection does not pin the dead context, and cancel the
+     * scope so nothing already queued on Main fires. The service itself keeps playing; the next
+     * instance's module binds and takes the listener seat in `onServiceConnected`.
+     */
+    override fun invalidate() {
+        synchronized(emitLock) { invalidated = true }
+        if (::musicService.isInitialized && musicService.trackPlayerModule === this) {
+            musicService.trackPlayerModule = null
+        }
+        if (isServiceBound) {
+            isServiceBound = false
+            try {
+                context.unbindService(this)
+            } catch (e: IllegalArgumentException) {
+                Timber.w(e, "🎵 TrackPlayerModule.invalidate: service was not bound")
+            }
+        }
+        scope.cancel()
+        super.invalidate()
+    }
     private lateinit var musicService: MusicService
     private val context = reactContext
 
@@ -1164,7 +1212,7 @@ class TrackPlayerModule(
     
     override fun onPlaybackState(state: String, data: Bundle) {
         Timber.d("🎵 TrackPlayerModule.onPlaybackState: $state")
-        scope.launch {
+        emit {
             val stateObj = Arguments.createMap().apply {
                 putString("state", state)
                 // If there's error data in the bundle, add it
@@ -1180,35 +1228,35 @@ class TrackPlayerModule(
     
     override fun onPlaybackProgressUpdated(data: Bundle) {
         Timber.d("🎵 TrackPlayerModule.onPlaybackProgressUpdated")
-        scope.launch {
+        emit {
             emitOnPlaybackProgressUpdated(Arguments.fromBundle(data))
         }
     }
     
     override fun onPlaybackActiveTrackChanged(data: Bundle) {
         Timber.d("🎵 TrackPlayerModule.onPlaybackActiveTrackChanged")
-        scope.launch {
+        emit {
             emitOnPlaybackActiveTrackChanged(Arguments.fromBundle(data))
         }
     }
     
     override fun onPlaybackQueueEnded(data: Bundle) {
         Timber.d("🎵 TrackPlayerModule.onPlaybackQueueEnded")
-        scope.launch {
+        emit {
             emitOnPlaybackQueueEnded(Arguments.fromBundle(data))
         }
     }
     
     override fun onPlaybackError(error: String, data: Bundle) {
         Timber.d("🎵 TrackPlayerModule.onPlaybackError: $error")
-        scope.launch {
+        emit {
             emitOnPlaybackError(Arguments.fromBundle(data))
         }
     }
     
     override fun onPlaybackPlayWhenReadyChanged(data: Bundle) {
         Timber.d("🎵 TrackPlayerModule.onPlaybackPlayWhenReadyChanged")
-        scope.launch {
+        emit {
             emitOnPlaybackPlayWhenReadyChanged(Arguments.fromBundle(data))
         }
     }
@@ -1216,76 +1264,76 @@ class TrackPlayerModule(
     // Remote control events
     override fun onRemotePlay() {
         Timber.d("🎵 TrackPlayerModule.onRemotePlay")
-        scope.launch {
+        emit {
             emitOnRemotePlay()
         }
     }
     
     override fun onRemotePause() {
         Timber.d("🎵 TrackPlayerModule.onRemotePause")
-        scope.launch {
+        emit {
             emitOnRemotePause()
         }
     }
     
     override fun onRemoteStop() {
         Timber.d("🎵 TrackPlayerModule.onRemoteStop")
-        scope.launch {
+        emit {
             emitOnRemoteStop()
         }
     }
     
     override fun onRemoteNext() {
         Timber.d("🎵 TrackPlayerModule.onRemoteNext")
-        scope.launch {
+        emit {
             emitOnRemoteNext()
         }
     }
     
     override fun onRemotePrevious() {
         Timber.d("🎵 TrackPlayerModule.onRemotePrevious")
-        scope.launch {
+        emit {
             emitOnRemotePrevious()
         }
     }
     
     override fun onRemoteSeek(data: Bundle) {
         Timber.d("🎵 TrackPlayerModule.onRemoteSeek")
-        scope.launch {
+        emit {
             emitOnRemoteSeek(Arguments.fromBundle(data))
         }
     }
     
     override fun onRemoteJumpForward(data: Bundle) {
         Timber.d("🎵 TrackPlayerModule.onRemoteJumpForward")
-        scope.launch {
+        emit {
             emitOnRemoteJumpForward(Arguments.fromBundle(data))
         }
     }
     
     override fun onRemoteJumpBackward(data: Bundle) {
         Timber.d("🎵 TrackPlayerModule.onRemoteJumpBackward")
-        scope.launch {
+        emit {
             emitOnRemoteJumpBackward(Arguments.fromBundle(data))
         }
     }
     
     override fun onRemoteBookmark() {
         Timber.d("🎵 TrackPlayerModule.onRemoteBookmark")
-        scope.launch {
+        emit {
             emitOnRemoteBookmark()
         }
     }
     
     override fun onRemotePlayId(data: Bundle) {
         Timber.d("🎵 TrackPlayerModule.onRemotePlayId")
-        scope.launch {
+        emit {
             emitOnRemotePlayId(Arguments.fromBundle(data))
         }
     }
     
     override fun onRemoteBrowse(data: Bundle) {
-        scope.launch {
+        emit {
             emitOnRemoteBrowse(Arguments.fromBundle(data))
         }
     }
@@ -1293,7 +1341,7 @@ class TrackPlayerModule(
     override fun onRemotePlayFromSearch(data: Bundle) {
         val query = data.getString("query") ?: ""
         Timber.tag("GVA-RNTP").d("TrackPlayerModule.onRemotePlayFromSearch called with query: '$query'")
-        scope.launch {
+        emit {
             try {
                 emitOnRemotePlayFromSearch(Arguments.fromBundle(data))
                 Timber.tag("GVA-RNTP").d("TrackPlayerModule.onRemotePlayFromSearch event emitted successfully")
@@ -1305,7 +1353,7 @@ class TrackPlayerModule(
     
     override fun onRemotePrepareId(data: Bundle) {
         Timber.d("🎵 TrackPlayerModule.onRemotePrepareId")
-        scope.launch {
+        emit {
             emitOnRemotePrepareId(Arguments.fromBundle(data))
         }
     }
@@ -1313,7 +1361,7 @@ class TrackPlayerModule(
     override fun onRemotePrepareFromSearch(data: Bundle) {
         val query = data.getString("query") ?: ""
         Timber.tag("GVA-RNTP").d("TrackPlayerModule.onRemotePrepareFromSearch called with query: '$query'")
-        scope.launch {
+        emit {
             try {
                 emitOnRemotePrepareFromSearch(Arguments.fromBundle(data))
                 Timber.tag("GVA-RNTP").d("TrackPlayerModule.onRemotePrepareFromSearch event emitted successfully")
@@ -1325,21 +1373,21 @@ class TrackPlayerModule(
     
     override fun onRemoteSkip(data: Bundle) {
         Timber.d("🎵 TrackPlayerModule.onRemoteSkip")
-        scope.launch {
+        emit {
             emitOnRemoteSkip(Arguments.fromBundle(data))
         }
     }
     
     override fun onRemoteDuck(data: Bundle) {
         Timber.d("🎵 TrackPlayerModule.onRemoteDuck")
-        scope.launch {
+        emit {
             emitOnRemoteDuck(Arguments.fromBundle(data))
         }
     }
     
     override fun onRemoteSearch(data: Bundle) {
         Timber.tag("TrackPlayerModule").d("onRemoteSearch")
-        scope.launch {
+        emit {
             emitOnRemoteSearch(Arguments.fromBundle(data))
         }
     }
