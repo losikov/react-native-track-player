@@ -35,10 +35,10 @@ dependencies {
     implementation 'com.facebook.react:react-native'
     
     // KotlinAudio from JitPack (losikov fork)
-    // Commit 7899c1c: CbrMp3Extractor — exact seeking for constant-bitrate MP3s
+    // Commit 619ecd5: CbrMp3Extractor — exact seeking for constant-bitrate MP3s
     // Use full SHA — JitPack returns tagNotFound for a short hash
     // Previous: cb5f9d4 (jumpToItem positionMs), 2c6300b (Android Auto audio routing)
-    implementation 'com.github.losikov:KotlinAudio:7899c1c44716e937a0a7a6eade9412aa1197a9f0'
+    implementation 'com.github.losikov:KotlinAudio:619ecd5bade1eee8b5f660d268af72c6fed37c86'
     
     implementation "androidx.core:core-ktx:1.9.0"
     implementation "androidx.localbroadcastmanager:localbroadcastmanager:1.1.0"
