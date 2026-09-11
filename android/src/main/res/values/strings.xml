@@ -1,4 +1,9 @@
 <resources>
     <string name="rntp_temporary_channel_id">rntp_temporary_channel</string>
     <string name="rntp_temporary_channel_name">temporary_channel</string>
+
+    <!-- Vendored from KotlinAudio (see android/src/main/java/com/doublesymmetry/kotlinaudio/NOTICE.md) -->
+    <string name="play">Play</string>
+    <string name="pause">Pause</string>
+    <string name="playback_channel_name">Now Playing</string>
 </resources>

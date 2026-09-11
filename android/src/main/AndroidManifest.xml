@@ -21,7 +21,13 @@
             android:foregroundServiceType="mediaPlayback">
             <intent-filter>
                 <action android:name="android.intent.action.MEDIA_BUTTON" />
+                <!-- Legacy MediaBrowserServiceCompat clients (Android Auto, Google Assistant);
+                     media3 serves them through its built-in compat layer. -->
                 <action android:name="android.media.browse.MediaBrowserService" />
+                <!-- media3 controllers and browsers. MediaLibraryService extends
+                     MediaSessionService, so both actions are declared. -->
+                <action android:name="androidx.media3.session.MediaSessionService" />
+                <action android:name="androidx.media3.session.MediaLibraryService" />
             </intent-filter>
         </service>
 

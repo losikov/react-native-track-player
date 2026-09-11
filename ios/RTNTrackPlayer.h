@@ -7,6 +7,7 @@
 - (void)emitPlaybackError:(NSDictionary *)error;
 - (void)emitPlaybackActiveTrackChanged:(NSDictionary *)event;
 - (void)emitPlaybackPlayWhenReadyChanged:(NSDictionary *)event;
+- (void)emitPlaybackStopAtReached:(NSDictionary *)event;
 - (void)emitRemotePlay;
 - (void)emitRemotePause;
 - (void)emitRemoteStop;

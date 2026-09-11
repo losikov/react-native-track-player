@@ -1,10 +1,8 @@
 package com.doublesymmetry.trackplayer.service
 
-import android.annotation.SuppressLint
-import android.app.*
+import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
-import android.content.pm.ServiceInfo
 import android.media.AudioManager
 import android.net.Uri
 import android.os.Binder
@@ -12,40 +10,40 @@ import android.os.Build
 import android.os.Bundle
 import android.os.IBinder
 import android.provider.MediaStore
-import android.provider.Settings
-import android.support.v4.media.MediaBrowserCompat.MediaItem
-import android.support.v4.media.MediaDescriptionCompat
 import android.support.v4.media.RatingCompat
 import androidx.annotation.MainThread
-import androidx.core.app.NotificationCompat
-import androidx.core.app.NotificationCompat.PRIORITY_LOW
-import androidx.media.utils.MediaConstants
+import androidx.media3.common.MediaItem
+import androidx.media3.common.MediaMetadata
+import androidx.media3.common.util.UnstableApi
+import androidx.media3.session.LibraryResult
+import androidx.media3.session.MediaConstants
+import androidx.media3.session.MediaLibraryService
+import androidx.media3.session.MediaSession
+import androidx.media3.session.MediaSessionService
+import androidx.media3.session.SessionError
 import com.doublesymmetry.kotlinaudio.models.*
-import com.doublesymmetry.kotlinaudio.models.NotificationButton.*
+import com.doublesymmetry.kotlinaudio.players.InterceptingPlayer
 import com.doublesymmetry.kotlinaudio.players.QueuedAudioPlayer
-import com.google.android.exoplayer2.C
 import com.doublesymmetry.trackplayer.HeadlessJsMediaService
 import com.doublesymmetry.trackplayer.extensions.NumberExt.Companion.toMilliseconds
 import com.doublesymmetry.trackplayer.extensions.NumberExt.Companion.toSeconds
 import com.doublesymmetry.trackplayer.extensions.asLibState
 import com.doublesymmetry.trackplayer.extensions.find
-import com.doublesymmetry.trackplayer.model.MetadataAdapter
-import com.doublesymmetry.trackplayer.model.PlaybackMetadata
 import com.doublesymmetry.trackplayer.model.Track
 import com.doublesymmetry.trackplayer.model.TrackAudioItem
-import com.doublesymmetry.trackplayer.module.MusicEvents
-import com.doublesymmetry.trackplayer.module.MusicEvents.Companion.METADATA_PAYLOAD_KEY
 import com.doublesymmetry.trackplayer.utils.BundleUtils
-import com.doublesymmetry.trackplayer.utils.BundleUtils.setRating
 import com.doublesymmetry.trackplayer.utils.UriUtils
 import com.facebook.react.jstasks.HeadlessJsTaskConfig
+import com.google.common.collect.ImmutableList
+import com.google.common.util.concurrent.Futures
+import com.google.common.util.concurrent.ListenableFuture
+import com.google.common.util.concurrent.SettableFuture
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.flow
 import timber.log.Timber
+import java.util.Locale
 import java.util.concurrent.TimeUnit
 import kotlin.system.exitProcess
-import com.doublesymmetry.trackplayer.R as TrackPlayerR
-import com.google.android.exoplayer2.ui.R as ExoPlayerR
 
 /**
  * Interface for listening to MusicService events
@@ -60,7 +58,8 @@ interface MusicServiceEventListener {
     fun onPlaybackQueueEnded(data: Bundle)
     fun onPlaybackError(error: String, data: Bundle)
     fun onPlaybackPlayWhenReadyChanged(data: Bundle)
-    
+    fun onPlaybackStopAtReached(data: Bundle)
+
     // Remote control events
     fun onRemotePlay()
     fun onRemotePause()
@@ -78,61 +77,102 @@ interface MusicServiceEventListener {
     // PREPARE actions for reduced latency
     fun onRemotePrepareId(data: Bundle)
     fun onRemotePrepareFromSearch(data: Bundle)
-    
+
     // Search events
     fun onRemoteSearch(data: Bundle)
-    
+
     // Audio interruption events
     fun onRemoteDuck(data: Bundle)
 }
 
+/**
+ * The media3 `MediaLibraryService`.
+ *
+ * Compared with the `MediaBrowserServiceCompat` it replaces, three whole subsystems are gone:
+ * `setupForegrounding()`'s 108-line state machine plus `isForegroundService()` and
+ * `startAndStopEmptyNotificationToAvoidANR()` (media3 posts the notification and moves the service
+ * in and out of the foreground), the 903-line `NotificationManager` (see [RntpNotificationProvider])
+ * and the hand-rolled audio focus (ExoPlayer's own manager). What is *not* gone is any behaviour the
+ * app or a car can see: the browse tree and its content styles, voice search, PLAY and PREPARE from
+ * id and from search, the error state Assistant reads, the artwork content provider, and the fact
+ * that every transport command is routed to JS rather than applied natively.
+ *
+ * One structural difference is worth knowing about. media3 has to hand a session — and therefore a
+ * player — to the first controller that connects, and on an Android Auto cold start that happens
+ * before JS exists to call `setupPlayer`. So the engine is created on demand in [ensureSession] with
+ * whatever options are known, and [setupPlayer] applies the real ones when they arrive; the buffer
+ * sizes are the only thing that needs the player rebuilt, and that is safe exactly while the queue
+ * is still empty.
+ */
+@UnstableApi
 @MainThread
-class MusicService : HeadlessJsMediaService(), AudioManager.OnAudioFocusChangeListener {
-    private lateinit var player: QueuedAudioPlayer
-    
-    /**
-     * Get the player instance (for error reporting from external components)
-     */
-    fun getPlayer(): QueuedAudioPlayer? {
-        return if (::player.isInitialized) player else null
-    }
+class MusicService : HeadlessJsMediaService() {
+    private var engine: QueuedAudioPlayer? = null
+    private var sessionPlayer: InterceptingPlayer? = null
+    private var librarySession: MediaLibraryService.MediaLibrarySession? = null
+    private val notificationProvider by lazy { RntpNotificationProvider(this) }
+
     private val binder = MusicBinder()
     private val scope = MainScope()
     private var progressUpdateJob: Job? = null
+    private var eventJobs = mutableListOf<Job>()
+
     var mediaTree: Map<String, List<MediaItem>> = HashMap()
     var mediaTreeStyle: List<Int> = listOf(
-        MediaConstants.DESCRIPTION_EXTRAS_VALUE_CONTENT_STYLE_LIST_ITEM,
-        MediaConstants.DESCRIPTION_EXTRAS_VALUE_CONTENT_STYLE_LIST_ITEM)
-    
+        MediaConstants.EXTRAS_VALUE_CONTENT_STYLE_LIST_ITEM,
+        MediaConstants.EXTRAS_VALUE_CONTENT_STYLE_LIST_ITEM
+    )
+
     // Direct reference to TrackPlayerModule for New Architecture events
     var trackPlayerModule: MusicServiceEventListener? = null
-    
-    // Audio focus handling
-    private var audioManager: AudioManager? = null
-    private var interruptionStartTime: Long? = null
-    
-    // Search result callbacks - map search ID to Result callback
-    private val pendingSearchResults = mutableMapOf<String, Result<List<MediaItem>>>()
+
+    var ratingType: Int = RatingCompat.RATING_NONE
+
+    // Search result callbacks — a search id is answered by JS through sendSearchResults()
+    private class PendingSearch(
+        val query: String,
+        val controller: MediaSession.ControllerInfo,
+        val params: MediaLibraryService.LibraryParams?,
+    )
+
+    private val pendingSearchResults = mutableMapOf<String, PendingSearch>()
+    private val searchResults = mutableMapOf<String, List<MediaItem>>()
     private var searchIdCounter = 0
-    
-    // Pending search requests - queue search requests when TrackPlayerModule isn't ready yet
+
+    /** Queued when a browser searched before the React runtime existed. */
     private data class PendingSearchRequest(
         val query: String,
         val extras: Bundle?,
-        val result: Result<List<MediaItem>>
+        val controller: MediaSession.ControllerInfo,
+        val params: MediaLibraryService.LibraryParams?,
     )
+
     private val pendingSearchRequests = mutableListOf<PendingSearchRequest>()
-    
-    // Browse result callbacks - map mediaId to Result callback (for lazy initialization)
-    private val pendingBrowseResults = mutableMapOf<String, Result<List<MediaItem>>>()
+
+    /** `onGetChildren` for a node the tree does not have yet: resolved by `setBrowseTree`. */
+    private val pendingBrowseResults =
+        mutableMapOf<String, SettableFuture<LibraryResult<ImmutableList<MediaItem>>>>()
     private var isInitializingReactNative = false
 
-    @ExperimentalCoroutinesApi
     override fun onCreate() {
         Timber.tag("GVA-RNTP").d("RNTP musicservice created.")
         super.onCreate()
-        audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
-        MusicService.setInstance(this)
+        setInstance(this)
+        setForegroundServiceTimeoutMs(stopForegroundGracePeriod * 1000L)
+        // The ExoPlayer 2 build removed the notification outright in IDLE, STOPPED and ERROR
+        // (`REMOVABLE_STATES` in the deleted `setupForegrounding`). Stated explicitly rather than
+        // left to whatever media3's default happens to be in a given release.
+        setShowNotificationForIdlePlayer(SHOW_NOTIFICATION_FOR_IDLE_PLAYER_NEVER)
+        setListener(object : MediaSessionService.Listener {
+            override fun onForegroundServiceStartNotAllowedException() {
+                // The same JS error code the hand-written foregrounding used to report.
+                Timber.e("ForegroundServiceStartNotAllowedException: App tried to start a foreground Service when it was not allowed to do so.")
+                trackPlayerModule?.onPlaybackError("foreground service start not allowed", Bundle().apply {
+                    putString("message", "App tried to start a foreground Service when it was not allowed to do so.")
+                    putString("code", "android-foreground-service-start-not-allowed")
+                })
+            }
+        })
     }
 
     /**
@@ -142,385 +182,734 @@ class MusicService : HeadlessJsMediaService(), AudioManager.OnAudioFocusChangeLi
     var stoppingAppPausesPlayback = true
         private set
 
-    @SuppressLint("VisibleForTests")
-    override fun onGetRoot(
-            clientPackageName: String,
-            clientUid: Int,
-            rootHints: Bundle?
-    ): BrowserRoot {
-        // Detect Android Auto connection and ensure audio routing when playback is active
-        if (clientPackageName == "com.google.android.projection.gearhead") {
-            scope.launch {
-                kotlinx.coroutines.delay(500)
-                if (::player.isInitialized && player.isPlaying) {
-                    // Force audio session re-initialization to route audio to Android Auto
-                    // This is necessary because ExoPlayer 2.x doesn't automatically re-route
-                    // audio when Android Auto connects while playback is active
-                    player.ensureAudioSessionInitialized()
-                }
-            }
-        }
-        
-        // Log root hints for debugging
-        if (rootHints != null) {
-            val artSizeHint = rootHints.getInt("android.media.browse.EXTRA_MEDIA_ART_SIZE_HINT_PIXELS", -1)
-            if (artSizeHint > 0) {
-                Timber.tag("RNTP-AA").d("Android Auto requests images at size: ${artSizeHint}x${artSizeHint} pixels")
-            }
+    enum class AppKilledPlaybackBehavior(val string: String) {
+        CONTINUE_PLAYBACK("continue-playback"), PAUSE_PLAYBACK("pause-playback"), STOP_PLAYBACK_AND_REMOVE_NOTIFICATION("stop-playback-and-remove-notification")
+    }
+
+    private var appKilledPlaybackBehavior = AppKilledPlaybackBehavior.CONTINUE_PLAYBACK
+
+    /**
+     * How long the service may stay in the foreground after playback stops.
+     *
+     * media3 keeps it there for ten minutes by default (`DEFAULT_FOREGROUND_SERVICE_TIMEOUT_MS`),
+     * which leaves an undismissable notification behind a pause. The ExoPlayer 2 build detached
+     * after `stopForegroundGracePeriod` seconds — five by default, and the app does not override it
+     * — so that option now drives media3's timeout instead of a hand-written state machine.
+     */
+    private var stopForegroundGracePeriod: Int = DEFAULT_STOP_FOREGROUND_GRACE_PERIOD
+
+    private var latestOptions: Bundle? = null
+    private var latestPlayerOptions: Bundle? = null
+    private var capabilities: List<Capability> = emptyList()
+    private var notificationCapabilities: List<Capability> = emptyList()
+    private var compactCapabilities: List<Capability> = emptyList()
+
+    private val player: QueuedAudioPlayer
+        get() = engine ?: throw IllegalStateException("The player is not initialized")
+
+    val tracks: List<Track>
+        get() = engine?.items?.map { (it as TrackAudioItem).track } ?: emptyList()
+
+    val currentTrack
+        get() = (player.currentItem as TrackAudioItem).track
+
+    val state
+        get() = engine?.playerState ?: AudioPlayerState.IDLE
+
+    val playbackError
+        get() = engine?.playbackError
+
+    val event
+        get() = player.event
+
+    var playWhenReady: Boolean
+        get() = engine?.playWhenReady ?: false
+        set(value) {
+            player.playWhenReady = value
         }
 
-        // CRITICAL: Always return a valid BrowserRoot for ALL clients FIRST (return quickly)
-        // Returning null would make the service undiscoverable by Google Assistant
-        // The MediaSession is created inside the service (via QueuedAudioPlayer) and
-        // is independent of the activity lifecycle, so we can always return a valid root.
-        val extras = Bundle()
-        extras.putInt(
-            MediaConstants.DESCRIPTION_EXTRAS_KEY_CONTENT_STYLE_BROWSABLE,
-            mediaTreeStyle[0]
+    // region session / player lifecycle
+
+    override fun onGetSession(controllerInfo: MediaSession.ControllerInfo): MediaLibraryService.MediaLibrarySession =
+        ensureSession()
+
+    @MainThread
+    private fun ensureSession(): MediaLibraryService.MediaLibrarySession {
+        librarySession?.let { return it }
+
+        val engine = ensurePlayer()
+        val intercepting = InterceptingPlayer(engine, mediaSessionCallback) { handleRemoteAction(it) }
+        configureSessionPlayer(intercepting)
+        sessionPlayer = intercepting
+
+        // The session activity: Google Assistant launches the app through this rather than the
+        // service ever starting an Activity itself.
+        val sessionActivityIntent = packageManager.getLaunchIntentForPackage(packageName)?.apply {
+            flags = Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP
+            action = Intent.ACTION_VIEW
+            data = Uri.parse("trackplayer://session-activity")
+        }
+
+        val builder = MediaLibraryService.MediaLibrarySession.Builder(this, intercepting, LibraryCallback())
+        sessionActivityIntent?.let {
+            builder.setSessionActivity(PendingIntent.getActivity(this, 0, it, getPendingIntentFlags()))
+            Timber.d("🎵 MusicService: setSessionActivity() called with PendingIntent for MainActivity")
+        }
+        val session = builder.build()
+        librarySession = session
+        setMediaNotificationProvider(notificationProvider)
+        // `MediaSessionService` only wires a session to the notification manager in `addSession`,
+        // and it calls that itself only when a controller connects or a media button arrives. The
+        // app's own playback goes through the TurboModule and neither, so without this there would
+        // be no notification and no foreground service until something external connected.
+        addSession(session)
+        return session
+    }
+
+    @MainThread
+    private fun ensurePlayer(): QueuedAudioPlayer {
+        engine?.let { return it }
+        val options = latestPlayerOptions
+        val created = QueuedAudioPlayer(
+            this,
+            playerConfigFrom(options),
+            bufferConfigFrom(options),
+            cacheConfigFrom(options),
+            mediaSessionCallback,
         )
-        extras.putInt(
-            MediaConstants.DESCRIPTION_EXTRAS_KEY_CONTENT_STYLE_PLAYABLE,
-            mediaTreeStyle[1]
+        created.automaticallyUpdateNotificationMetadata =
+            options?.getBoolean(AUTO_UPDATE_METADATA, true) ?: true
+        engine = created
+        observeEvents()
+        return created
+    }
+
+    private fun playerConfigFrom(playerOptions: Bundle?) = PlayerConfig(
+        interceptPlayerActionsTriggeredExternally = true,
+        handleAudioBecomingNoisy = playerOptions?.getBoolean(AUTO_HANDLE_ROUTE_CHANGES) ?: true,
+        handleAudioFocus = playerOptions?.getBoolean(AUTO_HANDLE_INTERRUPTIONS) ?: false,
+        audioContentType = when (playerOptions?.getString(ANDROID_AUDIO_CONTENT_TYPE)) {
+            "music" -> AudioContentType.MUSIC
+            "speech" -> AudioContentType.SPEECH
+            "sonification" -> AudioContentType.SONIFICATION
+            "movie" -> AudioContentType.MOVIE
+            "unknown" -> AudioContentType.UNKNOWN
+            else -> AudioContentType.MUSIC
+        }
+    )
+
+    private fun bufferConfigFrom(playerOptions: Bundle?): BufferConfig? =
+        if (playerOptions == null) null else BufferConfig(
+            playerOptions.getDouble(MIN_BUFFER_KEY).toMilliseconds().toInt(),
+            playerOptions.getDouble(MAX_BUFFER_KEY).toMilliseconds().toInt(),
+            playerOptions.getDouble(PLAY_BUFFER_KEY).toMilliseconds().toInt(),
+            playerOptions.getDouble(BACK_BUFFER_KEY).toMilliseconds().toInt(),
         )
-        // Declare search support for browsable search results
-        extras.putBoolean(
-            MediaConstants.BROWSER_SERVICE_EXTRAS_KEY_SEARCH_SUPPORTED,
-            true
-        )
-        
-        // Check if Google Assistant is requesting suggested items
-        // EXTRA_SUGGESTED constant: "android.service.media.extra.SUGGESTED"
-        val isRequestingSuggested = rootHints?.getBoolean(
-            "android.service.media.extra.SUGGESTED",
-            false
-        ) ?: false
-        
-        // Return different root ID for suggested items vs normal browsing
-        val rootId = if (isRequestingSuggested) {
-            "/suggested"  // Root for Google Assistant recommendations
+
+    private fun cacheConfigFrom(playerOptions: Bundle?): CacheConfig? =
+        if (playerOptions == null) null else CacheConfig(playerOptions.getDouble(MAX_CACHE_SIZE_KEY).toLong())
+
+    /**
+     * Called by the module once JS has connected. If a browser already forced the engine into
+     * existence (Android Auto cold start), the real options are applied to it here instead.
+     */
+    @MainThread
+    fun setupPlayer(playerOptions: Bundle?) {
+        latestPlayerOptions = playerOptions
+        val existing = engine
+        if (existing != null) {
+            Timber.d("Player was initialized. Applying the options that arrived with setupPlayer.")
+            existing.automaticallyUpdateNotificationMetadata =
+                playerOptions?.getBoolean(AUTO_UPDATE_METADATA, true) ?: true
+            val rebuilt = existing.applyConfig(
+                playerConfigFrom(playerOptions),
+                bufferConfigFrom(playerOptions),
+                cacheConfigFrom(playerOptions),
+            )
+            if (rebuilt) {
+                val intercepting = InterceptingPlayer(existing, mediaSessionCallback) { handleRemoteAction(it) }
+                configureSessionPlayer(intercepting)
+                sessionPlayer = intercepting
+                librarySession?.player = intercepting
+            }
+        }
+        ensureSession()
+    }
+
+    /**
+     * Everything about the session player that is not decided by its constructor.
+     *
+     * **The transport policy.** Play, pause, stop, seek and the ±jumps arriving from the media
+     * session — lock screen, notification, Bluetooth, Android Auto, Assistant — are applied by the
+     * engine itself and then announced to JS, which records them without re-issuing them. The player
+     * is controllable whether or not a React context is alive. Next and previous stay routed to JS
+     * forever: JS owns their meaning (chapter navigation, the daily-date rule, the 20-second
+     * restart), as does a seek that names a different queue item.
+     *
+     * **The ±jump increments.** media3 takes them at `ExoPlayer.Builder` time, but the app sets them
+     * through `updateOptions`, which arrives later. The session and every controller read them from
+     * the session player, so the intercepting player answers with the configured values.
+     */
+    private fun configureSessionPlayer(target: InterceptingPlayer) {
+        target.policy = TransportPolicy.APPLY_NATIVELY_AND_NOTIFY
+        val forward = latestOptions?.getDouble(FORWARD_JUMP_INTERVAL_KEY, DEFAULT_JUMP_INTERVAL) ?: DEFAULT_JUMP_INTERVAL
+        val backward = latestOptions?.getDouble(BACKWARD_JUMP_INTERVAL_KEY, DEFAULT_JUMP_INTERVAL) ?: DEFAULT_JUMP_INTERVAL
+        target.seekForwardIncrementOverrideMs = (forward * 1000).toLong()
+        target.seekBackIncrementOverrideMs = (backward * 1000).toLong()
+    }
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        super.onStartCommand(intent, flags, startId)
+        // START_STICKY as on the ExoPlayer 2 build: the service is the thing that owns playback and
+        // is expected back if the system reclaims it.
+        return START_STICKY
+    }
+
+    override fun getTaskConfig(intent: Intent?): HeadlessJsTaskConfig? {
+        // TurboModule: Don't use headless tasks with New Architecture
+        // Remote control events are handled via direct TurboModule callbacks
+        return null
+    }
+
+    @MainThread
+    override fun onBind(intent: Intent?): IBinder? {
+        val intentAction = intent?.action
+        return if (intentAction != null) {
+            super.onBind(intent)
         } else {
-            "/"  // Default root for normal browsing
+            binder
         }
-        
-        val browserRoot = BrowserRoot(rootId, extras)
-
-        // Initialize React Native if not already initialized and browse tree is empty
-        // This ensures Android Auto can discover content even when app hasn't been launched
-        if (trackPlayerModule == null && mediaTree.isEmpty() && !isInitializingReactNative) {
-            isInitializingReactNative = true
-            initializeReactNativeForAndroidAuto()
-        }
-
-        // MediaBrowserService should NEVER launch an Activity (per Google Assistant guidelines)
-        // The MediaSession is created inside the service (via QueuedAudioPlayer) and is independent
-        // of the activity lifecycle. Assistant will launch Activity based on PendingIntent from
-        // setSessionActivity() or notification's PendingIntent if needed.
-        // 
-        // NOTE: Removed the Activity launch workaround that violated the "never launch Activity" rule.
-        // If React Native needs to be initialized, it should be done through proper service initialization
-        // or when the Activity is launched by the system/Assistant, not from MediaBrowserService.
-        //
-        // DRIVING MODE: The MediaSession playback state is managed by QueuedAudioPlayer based on actual
-        // playback state. When nothing is playing, the state is automatically STATE_NONE, which prevents
-        // the app from being brought to foreground during driving mode when onGetRoot() is called for
-        // recommendations. The MediaSessionConnector automatically updates playback state based on ExoPlayer
-        // state, so no explicit state management is needed here.
-
-        return browserRoot
     }
 
-    override fun onLoadChildren(
-            parentMediaId: String,
-            result: Result<List<MediaItem>>
-    ) {
-        // Check if React Native is initialized and browse tree has the key
-        // Note: An empty list is valid content (means "no items"), we only detach if the key doesn't exist
-        val keyExists = mediaTree.containsKey(parentMediaId)
-        
-        // Only detach if React Native isn't initialized OR the key doesn't exist in the tree yet
-        // If the key exists (even with empty list), we should return it immediately
-        if (trackPlayerModule == null || !keyExists) {
-            result.detach()
-            pendingBrowseResults[parentMediaId] = result
-            
-            // Initialize React Native if not already initializing
-            if (!isInitializingReactNative && trackPlayerModule == null) {
-                isInitializingReactNative = true
-                initializeReactNativeForAndroidAuto()
+    @MainThread
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        val engine = this.engine ?: return
+
+        when (appKilledPlaybackBehavior) {
+            AppKilledPlaybackBehavior.PAUSE_PLAYBACK -> engine.pause()
+            AppKilledPlaybackBehavior.STOP_PLAYBACK_AND_REMOVE_NOTIFICATION -> {
+                engine.clear()
+                engine.stop()
+
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                    stopForeground(STOP_FOREGROUND_REMOVE)
+                } else {
+                    @Suppress("DEPRECATION")
+                    stopForeground(true)
+                }
+
+                stopSelf()
+                exitProcess(0)
             }
-            
-            return
+            else -> {}
         }
-        
-        // React Native is initialized and we have content - proceed normally
-        trackPlayerModule?.onRemoteBrowse(Bundle().apply {
-            putString("mediaId", parentMediaId)
-        })
-        
-        val contentToReturn = mediaTree[parentMediaId] ?: emptyList()
-        result.sendResult(contentToReturn)
+        // Deliberately *not* calling super: media3's default stops the service as soon as playback
+        // is not ongoing, which after `pause-playback` would take the notification and the queue
+        // with it. The ExoPlayer 2 build left the service running, and so does this one.
     }
-    
-    /**
-     * Mark that React Native was initialized by MusicService so MainApplication can skip duplicate initialization.
-     * Uses reflection to find MainApplication class dynamically (works for any app package name).
-     */
-    private fun markReactNativeInitializedByMusicService() {
-        try {
-            val applicationClass = application.javaClass
-            val packageName = applicationClass.`package`?.name
-            if (packageName != null) {
-                // Try common MainApplication class name patterns
-                val mainAppClassNames = listOf(
-                    "$packageName.MainApplication",
-                    "${packageName}.app.MainApplication"
+
+    @MainThread
+    override fun onHeadlessJsTaskFinish(taskId: Int) {
+        // This is empty so ReactNative doesn't kill this service
+    }
+
+    @MainThread
+    override fun onDestroy() {
+        librarySession?.release()
+        librarySession = null
+        sessionPlayer = null
+        engine?.destroy()
+        engine = null
+
+        progressUpdateJob?.cancel()
+        eventJobs.forEach { it.cancel() }
+        eventJobs.clear()
+
+        // Unblock any browser still waiting on a node the tree never delivered.
+        pendingBrowseResults.values.forEach { it.set(LibraryResult.ofItemList(emptyList(), null)) }
+        pendingBrowseResults.clear()
+        pendingSearchResults.clear()
+        pendingSearchRequests.clear()
+
+        setInstance(null)
+        super.onDestroy()
+    }
+
+    // endregion
+
+    // region Android Auto / Assistant
+
+    private val mediaSessionCallback = object : AAMediaSessionCallBack {
+        override fun handlePlayFromMediaId(mediaId: String?, extras: Bundle?) {
+            Timber.tag("GVA-RNTP").d("RNTP received req to play from mediaID: $mediaId")
+            if (mediaId.isNullOrEmpty()) {
+                setPlaybackStateError(
+                    android.support.v4.media.session.PlaybackStateCompat.ERROR_CODE_APP_ERROR,
+                    "Invalid media ID provided"
                 )
-                for (className in mainAppClassNames) {
-                    try {
-                        val mainAppClass = Class.forName(className)
-                        val markMethod = mainAppClass.getMethod("markReactNativeInitializedByMusicService")
-                        markMethod.invoke(null)
-                        Timber.tag("RNTP-AA").d("Marked React Native as initialized via $className")
-                        return
-                    } catch (e: ClassNotFoundException) {
-                        // Try next pattern
-                        continue
-                    }
+                return
+            }
+            trackPlayerModule?.onRemotePlayId((extras ?: Bundle()).apply {
+                putString("id", mediaId)
+            })
+        }
+
+        override fun handlePlayFromSearch(query: String?, extras: Bundle?) {
+            Timber.tag("GVA-RNTP").d("RNTP received req to play from query: $query, extras: $extras")
+
+            val searchQuery = query ?: ""
+            val artistName = extras?.getString("android.intent.extra.artist")
+                ?: extras?.getString(MediaStore.EXTRA_MEDIA_ARTIST)
+            val albumName = extras?.getString("android.intent.extra.album")
+                ?: extras?.getString(MediaStore.EXTRA_MEDIA_ALBUM)
+            val title = extras?.getString(MediaStore.EXTRA_MEDIA_TITLE)
+
+            val hasSearchParams = searchQuery.isNotEmpty() ||
+                artistName != null || albumName != null || title != null
+
+            if (!hasSearchParams) {
+                Timber.tag("GVA-RNTP").w("Empty search query with no metadata provided")
+            }
+
+            val searchBundle = Bundle().apply {
+                putString("query", searchQuery)
+                if (extras != null) {
+                    putBundle("extras", extras)
+                    artistName?.let { putString("artist", it) }
+                    albumName?.let { putString("album", it) }
                 }
             }
-        } catch (e: Exception) {
-            // MainApplication not found or method doesn't exist - that's OK, will check context directly
-            Timber.tag("RNTP-AA").d("Could not mark React Native as initialized: ${e.message}")
+
+            val module = trackPlayerModule
+            if (module == null) {
+                Timber.tag("GVA-RNTP").w("TrackPlayerModule is null, cannot handle play from search. Initializing React Native...")
+                startReactNativeIfNeeded()
+                android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
+                    if (trackPlayerModule != null) {
+                        Timber.tag("GVA-RNTP").d("TrackPlayerModule now available, retrying play from search")
+                    } else {
+                        Timber.tag("GVA-RNTP").e("TrackPlayerModule still null after initialization delay, play from search may fail")
+                    }
+                    trackPlayerModule?.onRemotePlayFromSearch(searchBundle)
+                }, 2000)
+                return
+            }
+
+            Timber.tag("GVA-RNTP").d("Calling TrackPlayerModule.onRemotePlayFromSearch with query: '$searchQuery'")
+            module.onRemotePlayFromSearch(searchBundle)
+        }
+
+        override fun handlePrepareFromMediaId(mediaId: String?, extras: Bundle?) {
+            Timber.tag("GVA-RNTP").d("RNTP received req to prepare from mediaID: $mediaId")
+            if (mediaId.isNullOrEmpty()) {
+                setPlaybackStateError(
+                    android.support.v4.media.session.PlaybackStateCompat.ERROR_CODE_APP_ERROR,
+                    "Invalid media ID provided"
+                )
+                return
+            }
+            trackPlayerModule?.onRemotePrepareId((extras ?: Bundle()).apply {
+                putString("id", mediaId)
+                putBoolean("playWhenReady", false) // PREPARE always means prepare without playing
+            })
+        }
+
+        override fun handlePrepareFromSearch(query: String?, extras: Bundle?) {
+            Timber.tag("GVA-RNTP").d("RNTP received req to prepare from query: $query, extras: $extras")
+            val searchBundle = Bundle().apply {
+                putString("query", query ?: "")
+                putBoolean("playWhenReady", false)
+                if (extras != null) {
+                    putBundle("extras", extras)
+                    extras.getString("android.intent.extra.artist")?.let { putString("artist", it) }
+                    extras.getString("android.intent.extra.album")?.let { putString("album", it) }
+                    extras.getString(MediaStore.EXTRA_MEDIA_ARTIST)?.let { putString("artist", it) }
+                    extras.getString(MediaStore.EXTRA_MEDIA_ALBUM)?.let { putString("album", it) }
+                }
+            }
+
+            val module = trackPlayerModule
+            if (module == null) {
+                Timber.tag("GVA-RNTP").w("TrackPlayerModule is null, cannot handle prepare from search. Initializing React Native...")
+                startReactNativeIfNeeded()
+                android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
+                    if (trackPlayerModule != null) {
+                        Timber.tag("GVA-RNTP").d("TrackPlayerModule now available, retrying prepare from search")
+                    } else {
+                        Timber.tag("GVA-RNTP").e("TrackPlayerModule still null after initialization delay, prepare from search may fail")
+                    }
+                    trackPlayerModule?.onRemotePrepareFromSearch(searchBundle)
+                }, 2000)
+                return
+            }
+
+            Timber.tag("GVA-RNTP").d("Calling TrackPlayerModule.onRemotePrepareFromSearch with query: '${query ?: ""}'")
+            module.onRemotePrepareFromSearch(searchBundle)
+        }
+
+        override fun handleSkipToQueueItem(id: Long) {
+            Timber.tag("GVA-RNTP").d("RNTP received req to play from queue index: $id")
+            trackPlayerModule?.onRemoteSkip(Bundle().apply { putInt("index", id.toInt()) })
         }
     }
-    
+
     /**
-     * Initialize React Native context for Android Auto.
-     * This uses HeadlessJsMediaService's mechanism to create React context in background.
+     * The library callback: the media3 shape of `onGetRoot` / `onLoadChildren` / `onSearch`.
+     *
+     * Legacy `MediaBrowserCompat` clients — Android Auto and Google Assistant — reach it through
+     * media3's built-in compat layer, so every content-style hint and every extra keeps the same key
+     * it had before; only the container changed from `MediaDescriptionCompat.extras` to
+     * `MediaMetadata.extras`.
      */
-    private fun initializeReactNativeForAndroidAuto() {
+    private inner class LibraryCallback : MediaLibraryService.MediaLibrarySession.Callback {
+
+        override fun onGetLibraryRoot(
+            session: MediaLibraryService.MediaLibrarySession,
+            browser: MediaSession.ControllerInfo,
+            params: MediaLibraryService.LibraryParams?
+        ): ListenableFuture<LibraryResult<MediaItem>> {
+            // Android Auto connecting while playback is live: re-apply the audio attributes so the
+            // sound is routed to the head unit (KotlinAudio 2c6300b).
+            if (browser.packageName == ANDROID_AUTO_PACKAGE) {
+                scope.launch {
+                    delay(500)
+                    engine?.let { if (it.isPlaying) it.ensureAudioSessionInitialized() }
+                }
+            }
+
+            params?.extras?.getInt("android.media.browse.EXTRA_MEDIA_ART_SIZE_HINT_PIXELS", -1)?.let {
+                if (it > 0) Timber.tag("RNTP-AA").d("Android Auto requests images at size: ${it}x${it} pixels")
+            }
+
+            val extras = Bundle().apply {
+                putInt(MediaConstants.EXTRAS_KEY_CONTENT_STYLE_BROWSABLE, mediaTreeStyle[0])
+                putInt(MediaConstants.EXTRAS_KEY_CONTENT_STYLE_PLAYABLE, mediaTreeStyle[1])
+                // Declare search support for browsable search results.
+                putBoolean(BROWSER_SERVICE_EXTRAS_KEY_SEARCH_SUPPORTED, true)
+            }
+
+            // A different root for Assistant's "suggested" request, as before.
+            val rootId = if (params?.isSuggested == true) "/suggested" else "/"
+
+            // Never brings the app to the foreground: this returns a tree, nothing else.
+            if (trackPlayerModule == null && mediaTree.isEmpty()) {
+                startReactNativeIfNeeded()
+            }
+
+            val root = MediaItem.Builder()
+                .setMediaId(rootId)
+                .setMediaMetadata(
+                    MediaMetadata.Builder()
+                        .setIsBrowsable(true)
+                        .setIsPlayable(false)
+                        .setMediaType(MediaMetadata.MEDIA_TYPE_FOLDER_MIXED)
+                        .build()
+                )
+                .build()
+
+            return Futures.immediateFuture(
+                LibraryResult.ofItem(
+                    root,
+                    MediaLibraryService.LibraryParams.Builder().setExtras(extras).build()
+                )
+            )
+        }
+
+        override fun onGetChildren(
+            session: MediaLibraryService.MediaLibrarySession,
+            browser: MediaSession.ControllerInfo,
+            parentId: String,
+            page: Int,
+            pageSize: Int,
+            params: MediaLibraryService.LibraryParams?
+        ): ListenableFuture<LibraryResult<ImmutableList<MediaItem>>> {
+            // An empty list is valid content ("no items"); only a missing key means "not built yet".
+            val keyExists = mediaTree.containsKey(parentId)
+
+            if (trackPlayerModule == null || !keyExists) {
+                // getOrPut, not put: two browsers asking for the same node before the tree exists
+                // share one future, so neither is left holding one that is never completed.
+                val future = pendingBrowseResults.getOrPut(parentId) { SettableFuture.create() }
+                startReactNativeIfNeeded()
+                return future
+            }
+
+            trackPlayerModule?.onRemoteBrowse(Bundle().apply { putString("mediaId", parentId) })
+            return Futures.immediateFuture(
+                LibraryResult.ofItemList(mediaTree[parentId] ?: emptyList(), params)
+            )
+        }
+
+        override fun onGetItem(
+            session: MediaLibraryService.MediaLibrarySession,
+            browser: MediaSession.ControllerInfo,
+            mediaId: String
+        ): ListenableFuture<LibraryResult<MediaItem>> {
+            val item = mediaTree.values.asSequence().flatten().firstOrNull { it.mediaId == mediaId }
+                ?: searchResults.values.asSequence().flatten().firstOrNull { it.mediaId == mediaId }
+            return Futures.immediateFuture(
+                if (item != null) LibraryResult.ofItem(item, null)
+                else LibraryResult.ofError(LibraryResult.RESULT_ERROR_BAD_VALUE)
+            )
+        }
+
+        override fun onSearch(
+            session: MediaLibraryService.MediaLibrarySession,
+            browser: MediaSession.ControllerInfo,
+            query: String,
+            params: MediaLibraryService.LibraryParams?
+        ): ListenableFuture<LibraryResult<Void>> {
+            Timber.tag("RNTP-AA").d("RNTP received search req: query='$query', params=${params?.extras}")
+
+            if (trackPlayerModule == null) {
+                Timber.tag("RNTP-AA").w("TrackPlayerModule is null, queueing search request: query='$query'")
+                pendingSearchRequests.add(PendingSearchRequest(query, params?.extras, browser, params))
+                startReactNativeIfNeeded()
+            } else {
+                processSearchRequest(query, params?.extras, browser, params)
+            }
+            return Futures.immediateFuture(LibraryResult.ofVoid(params))
+        }
+
+        override fun onGetSearchResult(
+            session: MediaLibraryService.MediaLibrarySession,
+            browser: MediaSession.ControllerInfo,
+            query: String,
+            page: Int,
+            pageSize: Int,
+            params: MediaLibraryService.LibraryParams?
+        ): ListenableFuture<LibraryResult<ImmutableList<MediaItem>>> {
+            val all = searchResults[query] ?: emptyList()
+            val from = (page * pageSize).coerceAtMost(all.size)
+            val to = (from + pageSize).coerceAtMost(all.size)
+            return Futures.immediateFuture(LibraryResult.ofItemList(all.subList(from, to), params))
+        }
+
+        /**
+         * media3's replacement for `onPlayFromMediaId` / `onPlayFromSearch`: the request arrives as
+         * a URI-less "request item" here and then as `setMediaItems`/`prepare`/`play` on the session
+         * player, where [InterceptingPlayer] captures it. The items are returned unchanged because
+         * media3 requires a resolved future and the real queue is loaded by JS.
+         */
+        override fun onSetMediaItems(
+            mediaSession: MediaSession,
+            controller: MediaSession.ControllerInfo,
+            mediaItems: MutableList<MediaItem>,
+            startIndex: Int,
+            startPositionMs: Long
+        ): ListenableFuture<MediaSession.MediaItemsWithStartPosition> =
+            Futures.immediateFuture(
+                MediaSession.MediaItemsWithStartPosition(mediaItems, startIndex, startPositionMs)
+            )
+
+        override fun onAddMediaItems(
+            mediaSession: MediaSession,
+            controller: MediaSession.ControllerInfo,
+            mediaItems: MutableList<MediaItem>
+        ): ListenableFuture<MutableList<MediaItem>> = Futures.immediateFuture(mediaItems)
+
+        /**
+         * "Play without launching the app" — a head unit or the system resumption notification
+         * asking for the last thing that was playing. Answered with the first playable item of the
+         * `recent` node, which reaches JS as `onRemotePrepareId` through [InterceptingPlayer]
+         * because it carries a media id and no URI.
+         */
+        override fun onPlaybackResumption(
+            mediaSession: MediaSession,
+            controller: MediaSession.ControllerInfo,
+            isForPlayback: Boolean,
+        ): ListenableFuture<MediaSession.MediaItemsWithStartPosition> {
+            val recent = mediaTree["recent"] ?: mediaTree["/recent"]
+            val playable = recent?.firstOrNull { it.mediaMetadata.isPlayable == true }
+            if (playable == null) {
+                startReactNativeIfNeeded()
+                return Futures.immediateFailedFuture(
+                    UnsupportedOperationException("No recent item to resume")
+                )
+            }
+            return Futures.immediateFuture(
+                MediaSession.MediaItemsWithStartPosition(
+                    ImmutableList.of(MediaItem.Builder().setMediaId(playable.mediaId).build()),
+                    0,
+                    androidx.media3.common.C.TIME_UNSET,
+                )
+            )
+        }
+    }
+
+    /**
+     * Bring up the React runtime for a browse that arrived before the app ever ran.
+     *
+     * The tree is built in JS, so an Auto cold start has to start the runtime and then wait; the
+     * TurboModule binds as soon as it exists and pushes the tree in, which resolves whatever
+     * `onGetChildren` futures are outstanding.
+     */
+    private fun startReactNativeIfNeeded() {
+        if (isInitializingReactNative || trackPlayerModule != null) return
+        isInitializingReactNative = true
         Timber.tag("RNTP-AA").d("initializeReactNativeForAndroidAuto called")
         try {
-            val reactInstanceManager = (application as? com.facebook.react.ReactApplication)
-                ?.reactNativeHost?.reactInstanceManager
-            
-            if (reactInstanceManager == null) {
-                Timber.tag("RNTP-AA").e("ReactInstanceManager is null!")
+            val starting = ensureReactContext {
+                Timber.tag("RNTP-AA").d("React Native context ready, scheduling pending requests")
                 isInitializingReactNative = false
-                return
-            }
-            
-            val reactContext = reactInstanceManager.currentReactContext
-            
-            if (reactContext != null) {
-                Timber.tag("RNTP-AA").d("React Native context already exists, marking as initialized")
-                isInitializingReactNative = false
-                // React Native is already initialized, but trackPlayerModule might not be set yet
-                // It will be set when TrackPlayerModule binds, which will trigger sendPendingBrowseResults()
                 markReactNativeInitializedByMusicService()
-                return
-            }
-            
-            Timber.tag("RNTP-AA").d("React Native context not found, creating in background")
-            // React Native not initialized - create context in background
-            reactInstanceManager.addReactInstanceEventListener(
-                object : com.facebook.react.ReactInstanceManager.ReactInstanceEventListener {
-                    override fun onReactContextInitialized(reactContext: com.facebook.react.bridge.ReactContext) {
-                        reactInstanceManager.removeReactInstanceEventListener(this)
-                        isInitializingReactNative = false
-                        Timber.tag("RNTP-AA").d("React Native context initialized, marking and scheduling pending requests")
-                        markReactNativeInitializedByMusicService()
-                        // TrackPlayerModule will connect and set trackPlayerModule, which will trigger sendPendingBrowseResults()
-                        // Give it a moment for TrackPlayerModule to bind
-                        android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
-                            if (trackPlayerModule != null) {
-                                Timber.tag("RNTP-AA").d("TrackPlayerModule available after RN init, processing pending requests")
-                                sendPendingBrowseResults()
-                                processPendingSearchRequests()
-                            } else {
-                                Timber.tag("RNTP-AA").w("TrackPlayerModule still null after RN init delay")
-                            }
-                        }, 1000) // Wait 1 second for TrackPlayerModule to bind
+                android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
+                    if (trackPlayerModule != null) {
+                        Timber.tag("RNTP-AA").d("TrackPlayerModule available after RN init, processing pending requests")
+                        sendPendingBrowseResults()
+                        processPendingSearchRequests()
+                    } else {
+                        Timber.tag("RNTP-AA").w("TrackPlayerModule still null after RN init delay")
                     }
-                }
-            )
-            
-            // Also listen for initialization failures
-            try {
-                reactInstanceManager.createReactContextInBackground()
-                Timber.tag("RNTP-AA").d("Started creating React Native context in background")
-            } catch (e: Exception) {
-                Timber.tag("RNTP-AA").e(e, "Failed to create React context")
-                isInitializingReactNative = false
+                }, 1000)
+            }
+            if (!starting) {
+                Timber.tag("RNTP-AA").d("React Native context already exists")
             }
         } catch (e: Exception) {
             Timber.tag("RNTP-AA").e(e, "Error initializing React Native for Android Auto")
             isInitializingReactNative = false
         }
     }
-    
+
     /**
-     * Send pending browse results when browse tree is populated.
-     * Called from setBrowseTree() or when trackPlayerModule is set.
+     * Mark that React Native was initialized by MusicService so MainApplication can skip duplicate
+     * initialization. Uses reflection to find MainApplication dynamically (any app package name).
+     */
+    private fun markReactNativeInitializedByMusicService() {
+        try {
+            val packageName = application.javaClass.`package`?.name ?: return
+            listOf("$packageName.MainApplication", "$packageName.app.MainApplication").forEach { className ->
+                try {
+                    Class.forName(className)
+                        .getMethod("markReactNativeInitializedByMusicService")
+                        .invoke(null)
+                    Timber.tag("RNTP-AA").d("Marked React Native as initialized via $className")
+                    return
+                } catch (e: ClassNotFoundException) {
+                    // try the next pattern
+                }
+            }
+        } catch (e: Exception) {
+            Timber.tag("RNTP-AA").d("Could not mark React Native as initialized: ${e.message}")
+        }
+    }
+
+    /**
+     * Answer the browse requests that were waiting for the tree.
+     *
+     * Called both when the TurboModule binds and from `setBrowseTree`, and it only resolves nodes
+     * the tree actually has: on an Android Auto cold start the module binds a second or two before
+     * JS has built anything, and resolving then would hand the car an empty list for the root and
+     * leave it there. A one-shot `getChildren` — which is what a media3 browser does — has no second
+     * chance, unlike the legacy `subscribe` that `notifyChildrenChanged` could nudge afterwards.
      */
     fun sendPendingBrowseResults() {
         if (pendingBrowseResults.isEmpty()) {
             Timber.tag("RNTP-AA").d("No pending browse results to send")
             return
         }
-        
-        Timber.tag("RNTP-AA").d("Sending ${pendingBrowseResults.size} pending browse results")
-        val resultsToSend = pendingBrowseResults.toMap()
-        pendingBrowseResults.clear()
-        
-        resultsToSend.forEach { (parentMediaId, result) ->
+
+        val ready = pendingBrowseResults.filterKeys { mediaTree.containsKey(it) }
+        if (ready.isEmpty()) {
+            Timber.tag("RNTP-AA").d(
+                "%d browse request(s) still waiting for the tree: %s",
+                pendingBrowseResults.size,
+                pendingBrowseResults.keys,
+            )
+            return
+        }
+
+        Timber.tag("RNTP-AA").d("Sending ${ready.size} pending browse results")
+        ready.forEach { (parentMediaId, future) ->
+            pendingBrowseResults.remove(parentMediaId)
             val content = mediaTree[parentMediaId] ?: emptyList()
-            
-            // Notify React Native about the browse request
-            trackPlayerModule?.onRemoteBrowse(Bundle().apply {
-                putString("mediaId", parentMediaId)
-            })
-            
-            result.sendResult(content)
+            trackPlayerModule?.onRemoteBrowse(Bundle().apply { putString("mediaId", parentMediaId) })
+            future.set(LibraryResult.ofItemList(content, null))
         }
     }
-    
-    /**
-     * Process pending search requests that were queued before TrackPlayerModule was ready
-     */
+
+    /** Process search requests queued before the TurboModule was ready. */
     fun processPendingSearchRequests() {
         if (pendingSearchRequests.isEmpty()) {
             Timber.tag("RNTP-AA").d("No pending search requests to process")
             return
         }
-        
         if (trackPlayerModule == null) {
             Timber.tag("RNTP-AA").w("Cannot process pending search requests: TrackPlayerModule is null")
             return
         }
-        
+
         val requestsToProcess = pendingSearchRequests.toList()
         pendingSearchRequests.clear()
-        
+
         Timber.tag("RNTP-AA").d("Processing ${requestsToProcess.size} pending search requests")
-        requestsToProcess.forEach { request ->
-            Timber.tag("RNTP-AA").d("Processing queued search: query='${request.query}'")
-            processSearchRequest(request.query, request.extras, request.result)
+        requestsToProcess.forEach {
+            Timber.tag("RNTP-AA").d("Processing queued search: query='${it.query}'")
+            processSearchRequest(it.query, it.extras, it.controller, it.params)
         }
     }
 
-    override fun onSearch(
-            query: String,
-            extras: Bundle?,
-            result: Result<List<MediaItem>>
-    ) {
-        Timber.tag("RNTP-AA").d("RNTP received search req: query='$query', extras=$extras")
-        
-        // Detach from result to unblock the caller (search can be expensive)
-        result.detach()
-        
-        // Check if TrackPlayerModule is ready
-        val module = trackPlayerModule
-        if (module == null) {
-            Timber.tag("RNTP-AA").w("TrackPlayerModule is null, queueing search request: query='$query'")
-            // Queue the search request to be processed when TrackPlayerModule binds
-            pendingSearchRequests.add(PendingSearchRequest(query, extras, result))
-            
-            // Initialize React Native if not already initializing
-            if (!isInitializingReactNative) {
-                isInitializingReactNative = true
-                initializeReactNativeForAndroidAuto()
-            }
-            return
-        }
-        
-        // TrackPlayerModule is ready - process search immediately
-        processSearchRequest(query, extras, result)
-    }
-    
-    /**
-     * Process a search request by calling React Native
-     */
     private fun processSearchRequest(
-            query: String,
-            extras: Bundle?,
-            result: Result<List<MediaItem>>
+        query: String,
+        extras: Bundle?,
+        controller: MediaSession.ControllerInfo,
+        params: MediaLibraryService.LibraryParams?,
     ) {
-        // Generate unique search ID
         val searchId = "search_${++searchIdCounter}_${System.currentTimeMillis()}"
-        
-        // Store result callback for later
-        pendingSearchResults[searchId] = result
-        
-        // Extract search parameters from extras
+        pendingSearchResults[searchId] = PendingSearch(query, controller, params)
+
         val artistName = extras?.getString("android.intent.extra.artist")
             ?: extras?.getString(MediaStore.EXTRA_MEDIA_ARTIST)
         val albumName = extras?.getString("android.intent.extra.album")
             ?: extras?.getString(MediaStore.EXTRA_MEDIA_ALBUM)
-        
-        // Call React Native to perform search
+
         val searchBundle = Bundle().apply {
             putString("searchId", searchId)
             putString("query", query)
             artistName?.let { putString("artistName", it) }
             albumName?.let { putString("albumName", it) }
         }
-        
+
         Timber.tag("RNTP-AA").d("Calling React Native for search: searchId=$searchId, query='$query', artistName=$artistName, albumName=$albumName")
         val module = trackPlayerModule
         if (module == null) {
             Timber.tag("RNTP-AA").e("TrackPlayerModule is null, cannot process search request")
-            result.sendResult(emptyList())
             pendingSearchResults.remove(searchId)
             return
         }
-        
         module.onRemoteSearch(searchBundle)
-        // Note: Results will be returned via sendSearchResults() method
+        // Results come back through sendSearchResults().
     }
-    
+
     /**
-     * Called from React Native (via TrackPlayerModule) to send search results back
-     * This completes the search request initiated by onSearch()
-     * @param trackResults List of maps containing track metadata: mediaId, title, artist, album, artwork
+     * Called from React Native (via TrackPlayerModule) to send search results back.
+     * @param trackResults maps of track metadata: mediaId, title, artist, album, artwork
      */
     fun sendSearchResults(searchId: String, trackResults: List<Map<String, String?>>) {
         Timber.tag("RNTP-AA").d("Received search results: searchId=$searchId, count=${trackResults.size}")
-        
-        val result = pendingSearchResults.remove(searchId)
-        if (result == null) {
+
+        val pending = pendingSearchResults.remove(searchId)
+        if (pending == null) {
             Timber.tag("RNTP-AA").w("No pending search result found for searchId: $searchId")
             return
         }
-        
-        // Convert track metadata to MediaItem objects on background thread
-        scope.launch(Dispatchers.IO) {
-            try {
-                val mediaItems = trackResults.mapNotNull { trackData ->
-                    createMediaItemFromTrackData(trackData)
-                }
-                
-                Timber.tag("RNTP-AA").d("Converted ${mediaItems.size} tracks to MediaItems for searchId: $searchId")
-                
-                // Send results on main thread
-                withContext(Dispatchers.Main) {
-                    result.sendResult(mediaItems)
-                }
-            } catch (e: Exception) {
-                Timber.tag("RNTP-AA").e(e, "Error converting search results for searchId: $searchId")
-                // This invokes onError() on the search callback
-                withContext(Dispatchers.Main) {
-                    result.sendResult(null)
-                }
+
+        scope.launch {
+            val mediaItems = withContext(Dispatchers.IO) {
+                trackResults.mapNotNull { createMediaItemFromTrackData(it) }
             }
+            Timber.tag("RNTP-AA").d("Converted ${mediaItems.size} tracks to MediaItems for searchId: $searchId")
+            searchResults[pending.query] = mediaItems
+            librarySession?.notifySearchResultChanged(
+                pending.controller,
+                pending.query,
+                mediaItems.size,
+                pending.params,
+            )
         }
     }
-    
-    /**
-     * Creates a MediaItem from track metadata provided by React Native
-     * @param trackData Map containing: mediaId, title, artist?, album?, artwork?, url?, duration?
-     * Note: url and duration are received but not used in MediaDescriptionCompat (they're playback properties)
-     */
+
     private fun createMediaItemFromTrackData(trackData: Map<String, String?>): MediaItem? {
         try {
             val mediaId = trackData["mediaId"] ?: return null
@@ -528,390 +917,84 @@ class MusicService : HeadlessJsMediaService(), AudioManager.OnAudioFocusChangeLi
             val artist = trackData["artist"]
             val album = trackData["album"]
             val artwork = trackData["artwork"]
-            
-            val descriptionBuilder = MediaDescriptionCompat.Builder()
-                .setMediaId(mediaId)
+
+            val metadata = MediaMetadata.Builder()
                 .setTitle(title)
-            
-            artist?.let { descriptionBuilder.setSubtitle(it) }
-            album?.let { descriptionBuilder.setDescription(it) }
-            artwork?.let { 
-                try {
-                    val uri = android.net.Uri.parse(it)
-                    val finalArtworkUri = when {
-                        uri.scheme == "file" -> {
-                            // Convert file:// to content://
-                            val convertedArtworkUri = UriUtils.convertFileUriToContentUri(this, it)
-                            if (convertedArtworkUri != null) {
-                                android.net.Uri.parse(convertedArtworkUri)
-                            } else {
-                                Timber.tag("RNTP-AA").w("createMediaItemFromTrackData: Failed to convert file:// URI, using original: $it")
-                                uri
-                            }
-                        }
-                        uri.scheme == "http" || uri.scheme == "https" -> {
-                            // For HTTPS URLs, try to find cached version and convert to content://
-                            // Android Auto requires content:// URIs for artwork, not HTTP/HTTPS
-                            val cachedUri = UriUtils.convertHttpUriToContentUri(this, it)
-                            if (cachedUri != null) {
-                                android.net.Uri.parse(cachedUri)
-                            } else {
-                                Timber.tag("RNTP-AA").w("createMediaItemFromTrackData: HTTPS URL not cached locally - Android Auto may not display this artwork: $it")
-                                Timber.tag("RNTP-AA").w("Consider downloading and caching images before setting artwork for tracks")
-                                uri // Fallback to HTTPS URL (may not work in Android Auto)
-                            }
-                        }
-                        else -> uri
-                    }
-                    descriptionBuilder.setIconUri(finalArtworkUri)
-                } catch (e: Exception) {
-                    Timber.tag("RNTP-AA").w(e, "Invalid artwork URI: $it")
-                }
-            }
-            
-            val description = descriptionBuilder.build()
-            return MediaItem(description, MediaItem.FLAG_PLAYABLE)
+                .setIsBrowsable(false)
+                .setIsPlayable(true)
+                .setMediaType(MediaMetadata.MEDIA_TYPE_AUDIO_BOOK)
+            artist?.let { metadata.setSubtitle(it); metadata.setArtist(it) }
+            album?.let { metadata.setDescription(it); metadata.setAlbumTitle(it) }
+            artwork?.let { metadata.setArtworkUri(browsableArtworkUri(it)) }
+
+            return MediaItem.Builder()
+                .setMediaId(mediaId)
+                .setMediaMetadata(metadata.build())
+                .build()
         } catch (e: Exception) {
             Timber.tag("RNTP-AA").e(e, "Error creating MediaItem from track data: $trackData")
             return null
         }
     }
-    
+
     /**
-     * Creates a MediaItem from a media ID (format: "track/{bookId}/{contentId}")
-     * Returns null if the media ID cannot be parsed or metadata cannot be retrieved
-     * 
-     * NOTE: This method is deprecated - use createMediaItemFromTrackData instead
-     * which receives full metadata from React Native.
+     * Android Auto reads artwork across a process boundary, so a `file://` in our private storage is
+     * unreadable there and an `https://` may not be fetched at all — both are turned into
+     * `content://` URIs served by `ImageContentProvider`, exactly as before.
      */
-    @Deprecated("Use createMediaItemFromTrackData instead")
-    private fun createMediaItemFromMediaId(mediaId: String): MediaItem? {
-        try {
-            val description = MediaDescriptionCompat.Builder()
-                .setMediaId(mediaId)
-                .setTitle(mediaId) // Temporary: use mediaId as title
-                .build()
-            
-            return MediaItem(description, MediaItem.FLAG_PLAYABLE)
-        } catch (e: Exception) {
-            Timber.tag("RNTP-AA").e(e, "Error creating MediaItem from media ID: $mediaId")
-            return null
+    private fun browsableArtworkUri(raw: String): Uri? = try {
+        val uri = Uri.parse(raw)
+        when (uri.scheme) {
+            "file" -> UriUtils.convertFileUriToContentUri(this, raw)?.let { Uri.parse(it) } ?: uri
+            "http", "https" -> UriUtils.convertHttpUriToContentUri(this, raw)?.let { Uri.parse(it) }
+                ?: uri.also {
+                    Timber.tag("RNTP-AA").w("HTTPS URL not cached locally - Android Auto may not display this artwork: $raw")
+                }
+            else -> uri
         }
+    } catch (e: Exception) {
+        Timber.tag("RNTP-AA").w(e, "Invalid artwork URI: $raw")
+        null
     }
 
-    enum class AppKilledPlaybackBehavior(val string: String) {
-        CONTINUE_PLAYBACK("continue-playback"), PAUSE_PLAYBACK("pause-playback"), STOP_PLAYBACK_AND_REMOVE_NOTIFICATION("stop-playback-and-remove-notification")
-    }
-
-    private var appKilledPlaybackBehavior = AppKilledPlaybackBehavior.CONTINUE_PLAYBACK
-    private var stopForegroundGracePeriod: Int = DEFAULT_STOP_FOREGROUND_GRACE_PERIOD
-
-    val tracks: List<Track>
-        get() = player.items.map { (it as TrackAudioItem).track }
-
-    val currentTrack
-        get() = (player.currentItem as TrackAudioItem).track
-
-    val state
-        get() = player.playerState
-
-    var ratingType: Int
-        get() = player.ratingType
-        set(value) {
-            player.ratingType = value
-        }
-
-    val playbackError
-        get() = player.playbackError
-
-    val event
-        get() = player.event
-
-    var playWhenReady: Boolean
-        get() = player.playWhenReady
-        set(value) {
-            player.playWhenReady = value
-        }
-
-    private var latestOptions: Bundle? = null
-    private var capabilities: List<Capability> = emptyList()
-    private var notificationCapabilities: List<Capability> = emptyList()
-    private var compactCapabilities: List<Capability> = emptyList()
-
-    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        // TurboModule: Only start headless task if config is provided (null for New Architecture)
-        val taskConfig = getTaskConfig(intent)
-        if (taskConfig != null) {
-            startTask(taskConfig)
-        }
-        startAndStopEmptyNotificationToAvoidANR()
-        return START_STICKY
+    /** `notifyChildrenChanged` for the browse tree, called by the module after `setBrowseTree`. */
+    fun notifyChildrenChanged(parentId: String) {
+        val count = mediaTree[parentId]?.size ?: 0
+        librarySession?.notifyChildrenChanged(parentId, count, null)
     }
 
     /**
-     * Workaround for the "Context.startForegroundService() did not then call Service.startForeground()"
-     * within 5s" ANR and crash by creating an empty notification and stopping it right after. For more
-     * information see https://github.com/doublesymmetry/react-native-track-player/issues/1666
+     * PlaybackState error for Google Assistant.
+     *
+     * JS speaks `PlaybackStateCompat` error codes; media3 speaks [SessionError] codes and converts
+     * them back for legacy controllers. [sessionErrorCodeFor] is that conversion run backwards, so
+     * the code Assistant sees is the code JS asked for.
      */
-    private fun startAndStopEmptyNotificationToAvoidANR() {
-        val notificationManager = this.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            notificationManager.createNotificationChannel(
-                NotificationChannel(getString(TrackPlayerR.string.rntp_temporary_channel_id), getString(TrackPlayerR.string.rntp_temporary_channel_name), NotificationManager.IMPORTANCE_LOW)
-            )
-        }
-
-        val notificationBuilder = NotificationCompat.Builder(this, getString(TrackPlayerR.string.rntp_temporary_channel_id))
-            .setPriority(PRIORITY_LOW)
-            .setCategory(Notification.CATEGORY_SERVICE)
-            .setSmallIcon(ExoPlayerR.drawable.exo_notification_small_icon)
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            notificationBuilder.foregroundServiceBehavior = NotificationCompat.FOREGROUND_SERVICE_IMMEDIATE
-        }
-        val notification = notificationBuilder.build()
-        try {
-            startForeground(EMPTY_NOTIFICATION_ID, notification)
-            @Suppress("DEPRECATION")
-            stopForeground(true)
-        } catch (error: Exception) {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S &&
-                error is android.app.ForegroundServiceStartNotAllowedException
-            ) {
-                Timber.e(
-                    "ForegroundServiceStartNotAllowedException: Cannot start foreground service in startAndStopEmptyNotificationToAvoidANR. This is non-fatal.",
-                    error
-                )
-                // Non-fatal: The service will still work, just without the ANR workaround
-            } else {
-                throw error
-            }
-        }
-    }
-
-    @MainThread
-    fun setupPlayer(playerOptions: Bundle?) {
-        if (this::player.isInitialized) {
-            Timber.d("Player was initialized. Prevent re-initializing again")
+    fun setPlaybackStateError(errorCode: Int, errorMessage: String) {
+        val session = librarySession
+        if (session == null) {
+            Timber.w("setPlaybackStateError before the session exists: $errorCode / $errorMessage")
             return
         }
-
-        val bufferConfig = BufferConfig(
-            playerOptions?.getDouble(MIN_BUFFER_KEY)?.toMilliseconds()?.toInt(),
-            playerOptions?.getDouble(MAX_BUFFER_KEY)?.toMilliseconds()?.toInt(),
-            playerOptions?.getDouble(PLAY_BUFFER_KEY)?.toMilliseconds()?.toInt(),
-            playerOptions?.getDouble(BACK_BUFFER_KEY)?.toMilliseconds()?.toInt(),
-        )
-
-        val cacheConfig = CacheConfig(playerOptions?.getDouble(MAX_CACHE_SIZE_KEY)?.toLong())
-        val playerConfig = PlayerConfig(
-            interceptPlayerActionsTriggeredExternally = true,
-            handleAudioBecomingNoisy = playerOptions?.getBoolean(AUTO_HANDLE_ROUTE_CHANGES) ?: true,
-            handleAudioFocus = playerOptions?.getBoolean(AUTO_HANDLE_INTERRUPTIONS) ?: false,
-            audioContentType = when(playerOptions?.getString(ANDROID_AUDIO_CONTENT_TYPE)) {
-                "music" -> AudioContentType.MUSIC
-                "speech" -> AudioContentType.SPEECH
-                "sonification" -> AudioContentType.SONIFICATION
-                "movie" -> AudioContentType.MOVIE
-                "unknown" -> AudioContentType.UNKNOWN
-                else -> AudioContentType.MUSIC
-            }
-        )
-
-        val automaticallyUpdateNotificationMetadata = playerOptions?.getBoolean(AUTO_UPDATE_METADATA, true) ?: true
-        val mediaSessionCallback = object: AAMediaSessionCallBack {
-            override fun handlePlayFromMediaId(mediaId: String?, extras: Bundle?) {
-                Timber.tag("GVA-RNTP").d("RNTP received req to play from mediaID: $mediaId")
-                if (mediaId.isNullOrEmpty()) {
-                    // Invalid media ID - set error state
-                    player?.setPlaybackStateError(
-                        android.support.v4.media.session.PlaybackStateCompat.ERROR_CODE_APP_ERROR,
-                        "Invalid media ID provided"
-                    )
-                    return
-                }
-                trackPlayerModule?.onRemotePlayId((extras ?: Bundle()).apply {
-                    putString("id", mediaId)
-                })
-            }
-
-            override fun handlePlayFromSearch(query: String?, extras: Bundle?) {
-                Timber.tag("GVA-RNTP").d("RNTP received req to play from query: $query, extras: $extras")
-                
-                // Extract search parameters to check if query is valid
-                val searchQuery = query ?: ""
-                val artistName = extras?.getString("android.intent.extra.artist")
-                    ?: extras?.getString(MediaStore.EXTRA_MEDIA_ARTIST)
-                val albumName = extras?.getString("android.intent.extra.album")
-                    ?: extras?.getString(MediaStore.EXTRA_MEDIA_ALBUM)
-                val title = extras?.getString(MediaStore.EXTRA_MEDIA_TITLE)
-                
-                // Check if we have any searchable parameters
-                val hasSearchParams = searchQuery.isNotEmpty() || 
-                    artistName != null || albumName != null || title != null
-                
-                if (!hasSearchParams) {
-                    // Empty query with no metadata - this will be handled by React Native
-                    // but we can set a warning (not an error, as onPlay() might handle it)
-                    Timber.tag("GVA-RNTP").w("Empty search query with no metadata provided")
-                }
-                
-                val searchBundle = Bundle().apply {
-                    putString("query", searchQuery)
-                    // Pass extras to React Native so SearchService can use artistName/albumName
-                    if (extras != null) {
-                        putBundle("extras", extras)
-                        // Also extract common extras as top-level keys for easier access
-                        artistName?.let {
-                            putString("artist", it)
-                        }
-                        albumName?.let {
-                            putString("album", it)
-                        }
-                    }
-                }
-                
-                // Check if TrackPlayerModule is ready
-                val module = trackPlayerModule
-                if (module == null) {
-                    Timber.tag("GVA-RNTP").w("TrackPlayerModule is null, cannot handle play from search. Initializing React Native...")
-                    // Initialize React Native if not already initializing
-                    if (!isInitializingReactNative) {
-                        isInitializingReactNative = true
-                        initializeReactNativeForAndroidAuto()
-                    }
-                    // Wait for TrackPlayerModule to bind, then retry
-                    // Use a delayed handler to retry after React Native initializes
-                    android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
-                        if (trackPlayerModule != null) {
-                            Timber.tag("GVA-RNTP").d("TrackPlayerModule now available, retrying play from search")
-                            trackPlayerModule?.onRemotePlayFromSearch(searchBundle)
-                        } else {
-                            Timber.tag("GVA-RNTP").e("TrackPlayerModule still null after initialization delay, play from search may fail")
-                            // Try anyway - React Native might handle it gracefully
-                            trackPlayerModule?.onRemotePlayFromSearch(searchBundle)
-                        }
-                    }, 2000) // Wait 2 seconds for TrackPlayerModule to bind
-                    return
-                }
-                
-                Timber.tag("GVA-RNTP").d("Calling TrackPlayerModule.onRemotePlayFromSearch with query: '$searchQuery'")
-                module.onRemotePlayFromSearch(searchBundle)
-            }
-            
-            override fun handlePrepareFromMediaId(mediaId: String?, extras: Bundle?) {
-                Timber.tag("GVA-RNTP").d("RNTP received req to prepare from mediaID: $mediaId")
-                if (mediaId.isNullOrEmpty()) {
-                    // Invalid media ID - set error state
-                    player?.setPlaybackStateError(
-                        android.support.v4.media.session.PlaybackStateCompat.ERROR_CODE_APP_ERROR,
-                        "Invalid media ID provided"
-                    )
-                    return
-                }
-                trackPlayerModule?.onRemotePrepareId((extras ?: Bundle()).apply {
-                    putString("id", mediaId)
-                    putBoolean("playWhenReady", false) // PREPARE always means prepare without playing
-                })
-            }
-
-            override fun handlePrepareFromSearch(query: String?, extras: Bundle?) {
-                Timber.tag("GVA-RNTP").d("RNTP received req to prepare from query: $query, extras: $extras")
-                val searchBundle = Bundle().apply {
-                    putString("query", query ?: "")
-                    putBoolean("playWhenReady", false) // PREPARE always means prepare without playing
-                    // Pass extras to React Native so SearchService can use artistName/albumName
-                    if (extras != null) {
-                        putBundle("extras", extras)
-                        // Also extract common extras as top-level keys for easier access
-                        extras.getString("android.intent.extra.artist")?.let {
-                            putString("artist", it)
-                        }
-                        extras.getString("android.intent.extra.album")?.let {
-                            putString("album", it)
-                        }
-                        extras.getString(MediaStore.EXTRA_MEDIA_ARTIST)?.let {
-                            putString("artist", it)
-                        }
-                        extras.getString(MediaStore.EXTRA_MEDIA_ALBUM)?.let {
-                            putString("album", it)
-                        }
-                    }
-                }
-                
-                // Check if TrackPlayerModule is ready
-                val module = trackPlayerModule
-                if (module == null) {
-                    Timber.tag("GVA-RNTP").w("TrackPlayerModule is null, cannot handle prepare from search. Initializing React Native...")
-                    // Initialize React Native if not already initializing
-                    if (!isInitializingReactNative) {
-                        isInitializingReactNative = true
-                        initializeReactNativeForAndroidAuto()
-                    }
-                    // Wait for TrackPlayerModule to bind, then retry
-                    android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
-                        if (trackPlayerModule != null) {
-                            Timber.tag("GVA-RNTP").d("TrackPlayerModule now available, retrying prepare from search")
-                            trackPlayerModule?.onRemotePrepareFromSearch(searchBundle)
-                        } else {
-                            Timber.tag("GVA-RNTP").e("TrackPlayerModule still null after initialization delay, prepare from search may fail")
-                            trackPlayerModule?.onRemotePrepareFromSearch(searchBundle)
-                        }
-                    }, 2000) // Wait 2 seconds for TrackPlayerModule to bind
-                    return
-                }
-                
-                Timber.tag("GVA-RNTP").d("Calling TrackPlayerModule.onRemotePrepareFromSearch with query: '${query ?: ""}'")
-                module.onRemotePrepareFromSearch(searchBundle)
-            }
-
-            override fun handleSkipToQueueItem(id: Long) {
-                Timber.tag("GVA-RNTP").d("RNTP received req to play from queue index: $id")
-                val skipBundle = Bundle().apply {
-                    putInt("index", id.toInt())
-                }
-                trackPlayerModule?.onRemoteSkip(skipBundle)
-            }
-        }
-        player = QueuedAudioPlayer(this@MusicService, playerConfig, bufferConfig, cacheConfig, mediaSessionCallback)
-        player.automaticallyUpdateNotificationMetadata = automaticallyUpdateNotificationMetadata
-        sessionToken = player.getMediaSessionToken()
-        
-        // Set session activity PendingIntent so Google Assistant can launch Activity when needed
-        // This allows Assistant to launch the Activity based on PendingIntent, rather than service launching it
-        val sessionActivityIntent = packageManager.getLaunchIntentForPackage(packageName)?.apply {
-            flags = Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP
-            action = Intent.ACTION_VIEW
-            data = Uri.parse("trackplayer://session-activity")
-        }
-        sessionActivityIntent?.let {
-            val sessionActivityPendingIntent = PendingIntent.getActivity(
-                this,
-                0,
-                it,
-                getPendingIntentFlags()
-            )
-            player.setSessionActivity(sessionActivityPendingIntent)
-            Timber.d("🎵 MusicService.setupPlayer: setSessionActivity() called with PendingIntent for MainActivity")
-        }
-        
-        observeEvents()
-        setupForegrounding()
+        val sessionErrorCode = sessionErrorCodeFor(errorCode)
+        Timber.tag("GVA-RNTP").d("setPlaybackStateError: legacy=%d -> session=%d, %s", errorCode, sessionErrorCode, errorMessage)
+        session.sendError(SessionError(sessionErrorCode, errorMessage))
     }
+
+    // endregion
+
+    // region options and playback API used by the module
 
     @MainThread
     fun updateOptions(options: Bundle) {
         Timber.d("🎵 MusicService.updateOptions: START")
         latestOptions = options
-        Timber.d("🎵 MusicService.updateOptions: getting androidOptions bundle")
         val androidOptions = options.getBundle(ANDROID_OPTIONS_KEY)
 
-        Timber.d("🎵 MusicService.updateOptions: setting appKilledPlaybackBehavior")
-        appKilledPlaybackBehavior = AppKilledPlaybackBehavior::string.find(androidOptions?.getString(APP_KILLED_PLAYBACK_BEHAVIOR_KEY)) ?: AppKilledPlaybackBehavior.CONTINUE_PLAYBACK
+        appKilledPlaybackBehavior =
+            AppKilledPlaybackBehavior::string.find(androidOptions?.getString(APP_KILLED_PLAYBACK_BEHAVIOR_KEY))
+                ?: AppKilledPlaybackBehavior.CONTINUE_PLAYBACK
 
-        Timber.d("🎵 MusicService.updateOptions: setting stopForegroundGracePeriod")
-        BundleUtils.getIntOrNull(androidOptions, STOP_FOREGROUND_GRACE_PERIOD_KEY)?.let { stopForegroundGracePeriod = it }
-
-        Timber.d("🎵 MusicService.updateOptions: handling deprecated flag")
         // TODO: This handles a deprecated flag. Should be removed soon.
         options.getBoolean(STOPPING_APP_PAUSES_PLAYBACK_KEY).let {
             stoppingAppPausesPlayback = options.getBoolean(STOPPING_APP_PAUSES_PLAYBACK_KEY)
@@ -920,81 +1003,43 @@ class MusicService : HeadlessJsMediaService(), AudioManager.OnAudioFocusChangeLi
             }
         }
 
-        Timber.d("🎵 MusicService.updateOptions: setting ratingType")
+        BundleUtils.getIntOrNull(androidOptions, STOP_FOREGROUND_GRACE_PERIOD_KEY)?.let {
+            stopForegroundGracePeriod = it
+        }
+        setForegroundServiceTimeoutMs(stopForegroundGracePeriod * 1000L)
+
         ratingType = BundleUtils.getInt(options, "ratingType", RatingCompat.RATING_NONE)
 
-        Timber.d("🎵 MusicService.updateOptions: setting alwaysPauseOnInterruption")
-        player.playerOptions.alwaysPauseOnInterruption = androidOptions?.getBoolean(PAUSE_ON_INTERRUPTION_KEY) ?: false
+        engine?.playerOptions?.alwaysPauseOnInterruption =
+            androidOptions?.getBoolean(PAUSE_ON_INTERRUPTION_KEY) ?: false
 
-        Timber.d("🎵 MusicService.updateOptions: setting capabilities")
         capabilities = parseCapabilities(options.getStringArrayList("capabilities"))
         notificationCapabilities = parseCapabilities(options.getStringArrayList("notificationCapabilities"))
         compactCapabilities = parseCapabilities(options.getStringArrayList("compactCapabilities"))
-
-        Timber.d("🎵 MusicService.updateOptions: checking notificationCapabilities")
         if (notificationCapabilities.isEmpty()) notificationCapabilities = capabilities
 
-        Timber.d("🎵 MusicService.updateOptions: creating buttonsList")
-        val buttonsList = notificationCapabilities.mapNotNull {
-            when (it) {
-                Capability.PLAY, Capability.PAUSE -> {
-                    val playIcon = BundleUtils.getIconOrNull(this, options, "playIcon")
-                    val pauseIcon = BundleUtils.getIconOrNull(this, options, "pauseIcon")
-                    PLAY_PAUSE(playIcon = playIcon, pauseIcon = pauseIcon)
-                }
-                Capability.STOP -> {
-                    val stopIcon = BundleUtils.getIconOrNull(this, options, "stopIcon")
-                    STOP(icon = stopIcon)
-                }
-                Capability.SKIP_TO_NEXT -> {
-                    val nextIcon = BundleUtils.getIconOrNull(this, options, "nextIcon")
-                    NEXT(icon = nextIcon, isCompact = isCompact(it))
-                }
-                Capability.SKIP_TO_PREVIOUS -> {
-                    val previousIcon = BundleUtils.getIconOrNull(this, options, "previousIcon")
-                    PREVIOUS(icon = previousIcon, isCompact = isCompact(it))
-                }
-                Capability.JUMP_FORWARD -> {
-                    val forwardIcon = BundleUtils.getIcon(this, options, "forwardIcon", TrackPlayerR.drawable.forward)
-                    FORWARD(icon = forwardIcon, isCompact = isCompact(it))
-                }
-                Capability.JUMP_BACKWARD -> {
-                    val backwardIcon = BundleUtils.getIcon(this, options, "rewindIcon", TrackPlayerR.drawable.rewind)
-                    BACKWARD(icon = backwardIcon, isCompact = isCompact(it))
-                }
-                Capability.SEEK_TO -> {
-                    SEEK_TO
-                }
-                else -> { null }
-            }
-        }
+        notificationProvider.notificationCapabilities = notificationCapabilities
+        notificationProvider.compactCapabilities = compactCapabilities
+        notificationProvider.playIcon = BundleUtils.getIconOrNull(this, options, "playIcon")
+        notificationProvider.pauseIcon = BundleUtils.getIconOrNull(this, options, "pauseIcon")
+        notificationProvider.stopIcon = BundleUtils.getIconOrNull(this, options, "stopIcon")
+        notificationProvider.nextIcon = BundleUtils.getIconOrNull(this, options, "nextIcon")
+        notificationProvider.previousIcon = BundleUtils.getIconOrNull(this, options, "previousIcon")
+        notificationProvider.forwardIcon =
+            BundleUtils.getIcon(this, options, "forwardIcon", com.doublesymmetry.trackplayer.R.drawable.forward)
+        notificationProvider.rewindIcon =
+            BundleUtils.getIcon(this, options, "rewindIcon", com.doublesymmetry.trackplayer.R.drawable.rewind)
+        BundleUtils.getIconOrNull(this, options, "icon")?.let { notificationProvider.setSmallIcon(it) }
+        sessionPlayer?.let { configureSessionPlayer(it) }
+        librarySession?.let { triggerNotificationUpdate() }
 
-        Timber.d("🎵 MusicService.updateOptions: creating openAppIntent")
-        val openAppIntent = packageManager.getLaunchIntentForPackage(packageName)?.apply {
-            flags = Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP
-            // Add the Uri data so apps can identify that it was a notification click
-            data = Uri.parse("trackplayer://notification.click")
-            action = Intent.ACTION_VIEW
-        }
-
-        Timber.d("🎵 MusicService.updateOptions: creating notificationConfig")
-        val accentColor = BundleUtils.getIntOrNull(options, "color")
-        val smallIcon = BundleUtils.getIconOrNull(this, options, "icon")
-        val pendingIntent = PendingIntent.getActivity(this, 0, openAppIntent, getPendingIntentFlags())
-        val notificationConfig = NotificationConfig(buttonsList, accentColor, smallIcon, pendingIntent)
-
-        Timber.d("🎵 MusicService.updateOptions: creating notification")
-        player.notificationManager.createNotification(notificationConfig)
-
-        Timber.d("🎵 MusicService.updateOptions: setting up progress update events")
         // setup progress update events if configured
         progressUpdateJob?.cancel()
         val updateInterval = BundleUtils.getDoubleOrNull(options, PROGRESS_UPDATE_EVENT_INTERVAL_KEY)
         if (updateInterval != null && updateInterval > 0) {
             progressUpdateJob = scope.launch {
-                progressUpdateEventFlow(updateInterval).collect { 
-                    Timber.d("🎵 MusicService calling trackPlayerModule.onPlaybackProgressUpdated")
-                    trackPlayerModule?.onPlaybackProgressUpdated(it) 
+                progressUpdateEventFlow(updateInterval).collect {
+                    trackPlayerModule?.onPlaybackProgressUpdated(it)
                 }
             }
         }
@@ -1004,25 +1049,20 @@ class MusicService : HeadlessJsMediaService(), AudioManager.OnAudioFocusChangeLi
     @MainThread
     private fun progressUpdateEventFlow(interval: Double) = flow {
         while (true) {
-            if (player.isPlaying) {
-                val bundle = progressUpdateEvent()
-                emit(bundle)
+            if (engine?.isPlaying == true) {
+                emit(progressUpdateEvent())
             }
-
             delay((interval * 1000).toLong())
         }
     }
 
     @MainThread
-    private suspend fun progressUpdateEvent(): Bundle {
-        return withContext(Dispatchers.Main) {
-            Bundle().apply {
-                putDouble(POSITION_KEY, player.position.toSeconds())
-                putDouble(DURATION_KEY, player.duration.toSeconds())
-                putDouble(BUFFERED_POSITION_KEY, player.bufferedPosition.toSeconds())
-                putInt(TRACK_KEY, player.currentIndex)
-            }
-        }
+    private fun progressUpdateEvent(): Bundle = Bundle().apply {
+        val player = engine
+        putDouble(POSITION_KEY, (player?.position ?: 0).toSeconds())
+        putDouble(DURATION_KEY, (player?.duration ?: 0).toSeconds())
+        putDouble(BUFFERED_POSITION_KEY, (player?.bufferedPosition ?: 0).toSeconds())
+        putInt(TRACK_KEY, player?.currentIndex ?: 0)
     }
 
     private fun getPendingIntentFlags(): Int {
@@ -1033,25 +1073,17 @@ class MusicService : HeadlessJsMediaService(), AudioManager.OnAudioFocusChangeLi
         }
     }
 
-    private fun isCompact(capability: Capability): Boolean {
-        return compactCapabilities.contains(capability)
-    }
-
     @MainThread
-    fun add(track: Track) {
-        add(listOf(track))
-    }
+    fun add(track: Track) = add(listOf(track))
 
     @MainThread
     fun add(tracks: List<Track>) {
-        val items = tracks.map { it.toAudioItem() }
-        player.add(items)
+        player.add(tracks.map { it.toAudioItem() })
     }
 
     @MainThread
     fun add(tracks: List<Track>, atIndex: Int) {
-        val items = tracks.map { it.toAudioItem() }
-        player.add(items, atIndex)
+        player.add(tracks.map { it.toAudioItem() }, atIndex)
     }
 
     @MainThread
@@ -1059,15 +1091,42 @@ class MusicService : HeadlessJsMediaService(), AudioManager.OnAudioFocusChangeLi
         player.load(track.toAudioItem())
     }
 
+    /**
+     * The atomic load: queue, index and start position in one call, then the intent.
+     *
+     * `startPositionSeconds <= 0` means "from the beginning" — [androidx.media3.common.C.TIME_UNSET]
+     * — so the caller never has to decide between 0 and "unset".
+     */
     @MainThread
-    fun move(fromIndex: Int, toIndex: Int) {
-        player.move(fromIndex, toIndex);
+    fun loadQueue(
+        tracks: List<Track>,
+        startIndex: Int,
+        startPositionSeconds: Double,
+        playWhenReady: Boolean,
+    ) {
+        val positionMs =
+            if (startPositionSeconds > 0) (startPositionSeconds * 1000).toLong()
+            else androidx.media3.common.C.TIME_UNSET
+        player.loadQueue(tracks.map { it.toAudioItem() }, startIndex, positionMs, playWhenReady)
     }
 
     @MainThread
-    fun remove(index: Int) {
-        remove(listOf(index))
+    fun setStopAt(positionSeconds: Double) {
+        player.setStopAt((positionSeconds * 1000).toLong())
     }
+
+    @MainThread
+    fun clearStopAt() {
+        player.clearStopAt()
+    }
+
+    @MainThread
+    fun move(fromIndex: Int, toIndex: Int) {
+        player.move(fromIndex, toIndex)
+    }
+
+    @MainThread
+    fun remove(index: Int) = remove(listOf(index))
 
     @MainThread
     fun remove(indexes: List<Int>) {
@@ -1110,7 +1169,7 @@ class MusicService : HeadlessJsMediaService(), AudioManager.OnAudioFocusChangeLi
             if (initialPositionSeconds != null && initialPositionSeconds > 0f) {
                 (initialPositionSeconds * 1000).toLong()
             } else {
-                C.TIME_UNSET
+                androidx.media3.common.C.TIME_UNSET
             }
         // Single seekTo(index, positionMs) — do not seek again after jumpToItem; ExoPlayer drops
         // a follow-up seek when prepare() is still running (iOS seekTo-after-jump works synchronously).
@@ -1134,7 +1193,7 @@ class MusicService : HeadlessJsMediaService(), AudioManager.OnAudioFocusChangeLi
 
     @MainThread
     fun seekBy(offset: Float) {
-        player.seekBy((offset.toLong()), TimeUnit.SECONDS)
+        player.seekBy(offset.toLong(), TimeUnit.SECONDS)
     }
 
     @MainThread
@@ -1178,12 +1237,27 @@ class MusicService : HeadlessJsMediaService(), AudioManager.OnAudioFocusChangeLi
     @MainThread
     fun getBufferedPositionInSeconds(): Double = player.bufferedPosition.toSeconds()
 
+    /**
+     * The `onPlaybackState` payload and `getPlaybackState()` return value.
+     *
+     * `state` and `error` are exactly what they were on ExoPlayer 2. Everything else is additive:
+     * the [com.doublesymmetry.kotlinaudio.models.PlayerSnapshot] fields the bridge starts carrying
+     * in step 3 and the JS button binds to in step 4.
+     */
     @MainThread
     fun getPlayerStateBundle(state: AudioPlayerState): Bundle {
         val bundle = Bundle()
         bundle.putString(STATE_KEY, state.asLibState.state)
         if (state == AudioPlayerState.ERROR) {
             bundle.putBundle(ERROR_KEY, getPlaybackErrorBundle())
+        }
+        engine?.state?.value?.let { snapshot ->
+            bundle.putBoolean("playWhenReady", snapshot.playWhenReady)
+            bundle.putBoolean("isPlaying", snapshot.isPlaying)
+            bundle.putString("transport", snapshot.transport.name.lowercase(Locale.US))
+            bundle.putString("readiness", snapshot.readiness.name.lowercase(Locale.US))
+            bundle.putString("reason", snapshot.transportReason.name.lowercase(Locale.US))
+            bundle.putString("suppression", snapshot.suppression.name.lowercase(Locale.US))
         }
         return bundle
     }
@@ -1195,261 +1269,153 @@ class MusicService : HeadlessJsMediaService(), AudioManager.OnAudioFocusChangeLi
 
     @MainThread
     fun updateNowPlayingMetadata(track: Track) {
-        player.notificationManager.overrideMetadata(track.toAudioItem())
+        player.overrideMetadata(track.toAudioItem())
     }
 
+    /**
+     * The ExoPlayer 2 build detached the notification here. media3 owns the notification's
+     * lifecycle: it goes away on its own once the player is idle with nothing queued, which is the
+     * state the app is in when it calls this (it fires when a book is unloaded).
+     */
     @MainThread
     fun clearNotificationMetadata() {
-        player.notificationManager.hideNotification()
+        engine?.let { if (it.items.isEmpty()) triggerNotificationUpdate() }
     }
 
-    private fun emitPlaybackTrackChangedEvents(
-        index: Int?,
-        previousIndex: Int?,
-        oldPosition: Double
-    ) {
-        // Only emit the modern playback-active-track-changed event
-        // The legacy playback-track-changed event is NOT in the TurboModule spec
-        val bundle = Bundle()
-        bundle.putDouble("lastPosition", oldPosition)
-        if (tracks.isNotEmpty()) {
-            bundle.putInt("index", player.currentIndex)
-            bundle.putBundle("track", tracks[player.currentIndex].originalItem)
-            if (previousIndex != null) {
-                bundle.putInt("lastIndex", previousIndex)
-                bundle.putBundle("lastTrack", tracks[previousIndex].originalItem)
-            }
-        }
-        Timber.d("🎵 MusicService calling trackPlayerModule.onPlaybackActiveTrackChanged")
-        trackPlayerModule?.onPlaybackActiveTrackChanged(bundle)
-    }
+    // endregion
 
-    private fun emitQueueEndedEvent() {
-        val bundle = Bundle()
-        bundle.putInt(TRACK_KEY, player.currentIndex)
-        bundle.putDouble(POSITION_KEY, player.position.toSeconds())
-        Timber.d("🎵 MusicService calling trackPlayerModule.onPlaybackQueueEnded")
-        trackPlayerModule?.onPlaybackQueueEnded(bundle)
-    }
+    // region events
 
-    @Suppress("DEPRECATION")
-    fun isForegroundService(): Boolean {
-        val manager = baseContext.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
-        for (service in manager.getRunningServices(Int.MAX_VALUE)) {
-            if (MusicService::class.java.name == service.service.className) {
-                return service.foreground
+    private fun handleRemoteAction(action: MediaSessionCallback) {
+        when (action) {
+            is MediaSessionCallback.RATING -> {
+                // BUTTON_SET_RATING is not in the TurboModule spec - skipping
             }
-        }
-        Timber.e("isForegroundService found no matching service")
-        return false
-    }
-
-    @MainThread
-    private fun setupForegrounding() {
-        // Implementation based on https://github.com/Automattic/pocket-casts-android/blob/ee8da0c095560ef64a82d3a31464491b8d713104/modules/services/repositories/src/main/java/au/com/shiftyjelly/pocketcasts/repositories/playback/PlaybackService.kt#L218
-        var notificationId: Int? = null
-        var notification: Notification? = null
-        var stopForegroundWhenNotOngoing = false
-        var removeNotificationWhenNotOngoing = false
-
-        fun startForegroundIfNecessary() {
-            if (isForegroundService()) {
-                Timber.d("skipping foregrounding as the service is already foregrounded")
-                return
-            }
-            if (notification == null) {
-                Timber.d("can't startForeground as the notification is null")
-                return
-            }
-            try {
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                    startForeground(
-                        notificationId!!,
-                        notification!!,
-                        ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK
-                    )
-                } else {
-                    startForeground(notificationId!!, notification)
-                }
-                Timber.d("notification has been foregrounded")
-            } catch (error: Exception) {
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S &&
-                    error is ForegroundServiceStartNotAllowedException
-                ) {
-                    Timber.e(
-                        "ForegroundServiceStartNotAllowedException: App tried to start a foreground Service when it was not allowed to do so.",
-                        error
-                    )
-                    trackPlayerModule?.onPlaybackError(error.message ?: "unknown", Bundle().apply {
-                        putString("message", error.message)
-                        putString("code", "android-foreground-service-start-not-allowed")
-                    })
-                }
-            }
-        }
-
-        scope.launch {
-            val BACKGROUNDABLE_STATES = listOf(
-                AudioPlayerState.IDLE,
-                AudioPlayerState.ENDED,
-                AudioPlayerState.STOPPED,
-                AudioPlayerState.ERROR,
-                AudioPlayerState.PAUSED
-            )
-            val REMOVABLE_STATES = listOf(
-                AudioPlayerState.IDLE,
-                AudioPlayerState.STOPPED,
-                AudioPlayerState.ERROR
-            )
-            val LOADING_STATES = listOf(
-                AudioPlayerState.LOADING,
-                AudioPlayerState.READY,
-                AudioPlayerState.BUFFERING
-            )
-            var stateCount = 0
-            event.stateChange.collect {
-                stateCount++
-                if (it in LOADING_STATES) return@collect;
-                // Skip initial idle state, since we are only interested when
-                // state becomes idle after not being idle
-                stopForegroundWhenNotOngoing = stateCount > 1 && it in BACKGROUNDABLE_STATES
-                removeNotificationWhenNotOngoing = stopForegroundWhenNotOngoing && it in REMOVABLE_STATES
-            }
-        }
-
-        fun shouldStopForeground(): Boolean {
-            return stopForegroundWhenNotOngoing && (removeNotificationWhenNotOngoing || isForegroundService())
-        }
-
-        scope.launch {
-            event.notificationStateChange.collect {
-                when (it) {
-                    is NotificationState.POSTED -> {
-                        Timber.d("notification posted with id=%s, ongoing=%s", it.notificationId, it.ongoing)
-                        notificationId = it.notificationId;
-                        notification = it.notification;
-                        if (it.ongoing) {
-                            if (player.playWhenReady) {
-                                startForegroundIfNecessary()
-                            }
-                        } else if (shouldStopForeground()) {
-                            // Allow the application a grace period to complete any actions
-                            // that may necessitate keeping the service in a foreground state.
-                            // For instance, queuing new media (e.g., related music) after the
-                            // user's queue is complete. This prevents the service from potentially
-                            // being immediately destroyed once the player finishes playing media.
-                            scope.launch {
-                                delay(stopForegroundGracePeriod.toLong() * 1000)
-                                if (shouldStopForeground()) {
-                                    @Suppress("DEPRECATION")
-                                    stopForeground(removeNotificationWhenNotOngoing)
-                                    Timber.d("Notification has been stopped")
-                                }
-                            }
-                        }
-                    }
-                    else -> {}
-                }
-            }
+            is MediaSessionCallback.SEEK -> trackPlayerModule?.onRemoteSeek(Bundle().apply {
+                putDouble("position", action.positionMs.toSeconds())
+            })
+            MediaSessionCallback.PLAY -> trackPlayerModule?.onRemotePlay()
+            MediaSessionCallback.PAUSE -> trackPlayerModule?.onRemotePause()
+            MediaSessionCallback.NEXT -> trackPlayerModule?.onRemoteNext()
+            MediaSessionCallback.PREVIOUS -> trackPlayerModule?.onRemotePrevious()
+            MediaSessionCallback.STOP -> trackPlayerModule?.onRemoteStop()
+            MediaSessionCallback.FORWARD -> trackPlayerModule?.onRemoteJumpForward(Bundle().apply {
+                val interval = latestOptions?.getDouble(FORWARD_JUMP_INTERVAL_KEY, DEFAULT_JUMP_INTERVAL) ?: DEFAULT_JUMP_INTERVAL
+                putInt("interval", interval.toInt())
+            })
+            MediaSessionCallback.REWIND -> trackPlayerModule?.onRemoteJumpBackward(Bundle().apply {
+                val interval = latestOptions?.getDouble(BACKWARD_JUMP_INTERVAL_KEY, DEFAULT_JUMP_INTERVAL) ?: DEFAULT_JUMP_INTERVAL
+                putInt("interval", interval.toInt())
+            })
         }
     }
 
     @MainThread
     private fun observeEvents() {
-        scope.launch {
+        val event = player.event
+
+        eventJobs += scope.launch {
             event.stateChange.collect {
-                Timber.d("🎵 Android TrackPlayer state change: ${it} -> ${it.asLibState.state}")
+                Timber.d("🎵 Android TrackPlayer state change: $it -> ${it.asLibState.state}")
                 val stateBundle = getPlayerStateBundle(it)
                 val state = stateBundle.getString("state") ?: ""
-                Timber.d("🎵 MusicService calling trackPlayerModule.onPlaybackState: $state")
                 trackPlayerModule?.onPlaybackState(state, stateBundle)
 
-                if (it == AudioPlayerState.ENDED && player.nextItem == null) {
+                if (it == AudioPlayerState.ENDED && engine?.nextItem == null) {
                     emitQueueEndedEvent()
                 }
             }
         }
 
-        scope.launch {
+        eventJobs += scope.launch {
             event.audioItemTransition.collect {
                 if (it !is AudioItemTransitionReason.REPEAT) {
                     emitPlaybackTrackChangedEvents(
-                        player.currentIndex,
-                        player.previousIndex,
+                        engine?.currentIndex,
+                        engine?.previousIndex,
                         (it?.oldPosition ?: 0).toSeconds()
                     )
                 }
             }
         }
 
-        scope.launch {
+        eventJobs += scope.launch {
             event.onAudioFocusChanged.collect {
-                // BUTTON_DUCK is not in TurboModule spec - skipping
+                // BUTTON_DUCK is not in the TurboModule spec - skipping
             }
         }
 
-        scope.launch {
-            event.onPlayerActionTriggeredExternally.collect {
-                when (it) {
-                    is MediaSessionCallback.RATING -> {
-                        // BUTTON_SET_RATING is not in TurboModule spec - skipping
-                    }
-                    is MediaSessionCallback.SEEK -> {
-                        trackPlayerModule?.onRemoteSeek(Bundle().apply {
-                            putDouble("position", it.positionMs.toSeconds())
-                        })
-                    }
-                    MediaSessionCallback.PLAY -> trackPlayerModule?.onRemotePlay()
-                    MediaSessionCallback.PAUSE -> trackPlayerModule?.onRemotePause()
-                    MediaSessionCallback.NEXT -> trackPlayerModule?.onRemoteNext()
-                    MediaSessionCallback.PREVIOUS -> trackPlayerModule?.onRemotePrevious()
-                    MediaSessionCallback.STOP -> trackPlayerModule?.onRemoteStop()
-                    MediaSessionCallback.FORWARD -> {
-                        trackPlayerModule?.onRemoteJumpForward(Bundle().apply {
-                            val interval = latestOptions?.getDouble(FORWARD_JUMP_INTERVAL_KEY, DEFAULT_JUMP_INTERVAL) ?: DEFAULT_JUMP_INTERVAL
-                            putInt("interval", interval.toInt())
-                        })
-                    }
-                    MediaSessionCallback.REWIND -> {
-                        trackPlayerModule?.onRemoteJumpBackward(Bundle().apply {
-                            val interval = latestOptions?.getDouble(BACKWARD_JUMP_INTERVAL_KEY, DEFAULT_JUMP_INTERVAL) ?: DEFAULT_JUMP_INTERVAL
-                            putInt("interval", interval.toInt())
-                        })
-                    }
-                }
+        eventJobs += scope.launch {
+            // A seek — including a seek while paused, which no interval tick reports — and an atomic
+            // queue load produce one progress event each, so JS's stored progress is never left
+            // holding the pre-seek position.
+            event.progressDiscontinuity.collect {
+                trackPlayerModule?.onPlaybackProgressUpdated(progressUpdateEvent())
             }
         }
 
-        scope.launch {
+        eventJobs += scope.launch {
             event.onTimedMetadata.collect {
-                // METADATA_TIMED_RECEIVED and PLAYBACK_METADATA are not in TurboModule spec - skipping
+                // METADATA_TIMED_RECEIVED and PLAYBACK_METADATA are not in the TurboModule spec
             }
         }
 
-        scope.launch {
+        eventJobs += scope.launch {
             event.onCommonMetadata.collect {
-                // METADATA_COMMON_RECEIVED is not in TurboModule spec - skipping
+                // METADATA_COMMON_RECEIVED is not in the TurboModule spec
             }
         }
 
-        scope.launch {
+        eventJobs += scope.launch {
             event.playWhenReadyChange.collect {
-                val bundle = Bundle().apply {
+                trackPlayerModule?.onPlaybackPlayWhenReadyChanged(Bundle().apply {
                     putBoolean("playWhenReady", it.playWhenReady)
-                }
-                Timber.d("🎵 MusicService calling trackPlayerModule.onPlaybackPlayWhenReadyChanged")
-                trackPlayerModule?.onPlaybackPlayWhenReadyChanged(bundle)
+                })
             }
         }
 
-        scope.launch {
+        eventJobs += scope.launch {
+            event.stopAtReached.collect {
+                trackPlayerModule?.onPlaybackStopAtReached(Bundle().apply {
+                    putDouble(POSITION_KEY, it.toSeconds())
+                })
+            }
+        }
+
+        eventJobs += scope.launch {
             event.playbackError.collect {
                 val errorBundle = getPlaybackErrorBundle()
                 val errorMessage = errorBundle.getString("message") ?: ""
-                Timber.d("🎵 MusicService calling trackPlayerModule.onPlaybackError: $errorMessage")
                 trackPlayerModule?.onPlaybackError(errorMessage, errorBundle)
             }
         }
+    }
+
+    private fun emitPlaybackTrackChangedEvents(index: Int?, previousIndex: Int?, oldPosition: Double) {
+        // Only emit the modern playback-active-track-changed event; the legacy
+        // playback-track-changed event is not in the TurboModule spec.
+        val tracks = tracks
+        val bundle = Bundle()
+        bundle.putDouble("lastPosition", oldPosition)
+        if (tracks.isNotEmpty()) {
+            val current = engine?.currentIndex ?: 0
+            if (current in tracks.indices) {
+                bundle.putInt("index", current)
+                bundle.putBundle("track", tracks[current].originalItem)
+            }
+            if (previousIndex != null && previousIndex in tracks.indices) {
+                bundle.putInt("lastIndex", previousIndex)
+                bundle.putBundle("lastTrack", tracks[previousIndex].originalItem)
+            }
+        }
+        trackPlayerModule?.onPlaybackActiveTrackChanged(bundle)
+    }
+
+    private fun emitQueueEndedEvent() {
+        trackPlayerModule?.onPlaybackQueueEnded(Bundle().apply {
+            putInt(TRACK_KEY, engine?.currentIndex ?: 0)
+            putDouble(POSITION_KEY, (engine?.position ?: 0).toSeconds())
+        })
     }
 
     private fun getPlaybackErrorBundle(): Bundle {
@@ -1464,75 +1430,7 @@ class MusicService : HeadlessJsMediaService(), AudioManager.OnAudioFocusChangeLi
         return bundle
     }
 
-
-    override fun getTaskConfig(intent: Intent?): HeadlessJsTaskConfig? {
-        // TurboModule: Don't use headless tasks with New Architecture
-        // Remote control events are handled via direct TurboModule callbacks
-        return null
-    }
-
-    @MainThread
-    override fun onBind(intent: Intent?): IBinder? {
-        val intentAction = intent?.action
-        return if (intentAction != null) {
-            super.onBind(intent)
-        } else {
-            binder
-        }
-    }
-
-    @MainThread
-    override fun onTaskRemoved(rootIntent: Intent?) {
-        super.onTaskRemoved(rootIntent)
-
-        if (!::player.isInitialized) return
-
-        when (appKilledPlaybackBehavior) {
-            AppKilledPlaybackBehavior.PAUSE_PLAYBACK -> player.pause()
-            AppKilledPlaybackBehavior.STOP_PLAYBACK_AND_REMOVE_NOTIFICATION -> {
-                player.clear()
-                player.stop()
-
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-                    stopForeground(STOP_FOREGROUND_REMOVE)
-                } else {
-                    @Suppress("DEPRECATION")
-                    stopForeground(true)
-                }
-
-                stopSelf()
-                exitProcess(0)
-            }
-            else -> {}
-        }
-    }
-
-    @MainThread
-    override fun onHeadlessJsTaskFinish(taskId: Int) {
-        // This is empty so ReactNative doesn't kill this service
-    }
-
-    @MainThread
-    override fun onDestroy() {
-        super.onDestroy()
-        if (::player.isInitialized) {
-            player.destroy()
-        }
-
-        progressUpdateJob?.cancel()
-        
-        // Clean up any pending search results to prevent memory leaks
-        pendingSearchResults.values.forEach { result ->
-            try {
-                result.sendResult(emptyList())
-            } catch (e: Exception) {
-                Timber.tag("RNTP-AA").w(e, "Error cleaning up search result")
-            }
-        }
-        pendingSearchResults.clear()
-        
-        MusicService.setInstance(null)
-    }
+    // endregion
 
     @MainThread
     inner class MusicBinder : Binder() {
@@ -1540,9 +1438,8 @@ class MusicService : HeadlessJsMediaService(), AudioManager.OnAudioFocusChangeLi
     }
 
     companion object {
-        const val EMPTY_NOTIFICATION_ID = 1
         const val STATE_KEY = "state"
-        const val ERROR_KEY  = "error"
+        const val ERROR_KEY = "error"
         const val EVENT_KEY = "event"
         const val DATA_KEY = "data"
         const val TRACK_KEY = "track"
@@ -1580,16 +1477,48 @@ class MusicService : HeadlessJsMediaService(), AudioManager.OnAudioFocusChangeLi
 
         const val DEFAULT_JUMP_INTERVAL = 15.0
         const val DEFAULT_STOP_FOREGROUND_GRACE_PERIOD = 5
-        
+
+        private const val ANDROID_AUTO_PACKAGE = "com.google.android.projection.gearhead"
+
+        /** `androidx.media.utils.MediaConstants.BROWSER_SERVICE_EXTRAS_KEY_SEARCH_SUPPORTED`. */
+        private const val BROWSER_SERVICE_EXTRAS_KEY_SEARCH_SUPPORTED =
+            "android.media.browse.SEARCH_SUPPORTED"
+
         // Static reference to MusicService instance for external access
         @Volatile
         private var instance: MusicService? = null
-        
+
         fun getInstance(): MusicService? = instance
-        
+
         fun setInstance(service: MusicService?) {
             instance = service
         }
+
+        /**
+         * `LegacyConversions.convertToLegacyErrorCode` run backwards.
+         *
+         * JS passes `PlaybackStateCompat` error codes (the app passes `1`, `ERROR_CODE_APP_ERROR`).
+         * media3 only accepts its own [SessionError] codes and maps them back for legacy
+         * controllers, so this picks the [SessionError] code whose legacy image is the one asked
+         * for; anything unmapped becomes `ERROR_UNKNOWN`, whose legacy image is
+         * `ERROR_CODE_UNKNOWN_ERROR`.
+         */
+        internal fun sessionErrorCodeFor(playbackStateCompatErrorCode: Int): Int =
+            when (playbackStateCompatErrorCode) {
+                0 -> SessionError.ERROR_UNKNOWN                            // UNKNOWN_ERROR
+                1 -> SessionError.ERROR_INVALID_STATE                      // APP_ERROR
+                2 -> SessionError.ERROR_NOT_SUPPORTED                      // NOT_SUPPORTED
+                3 -> SessionError.ERROR_SESSION_AUTHENTICATION_EXPIRED
+                4 -> SessionError.ERROR_SESSION_PREMIUM_ACCOUNT_REQUIRED
+                5 -> SessionError.ERROR_SESSION_CONCURRENT_STREAM_LIMIT
+                6 -> SessionError.ERROR_SESSION_PARENTAL_CONTROL_RESTRICTED
+                7 -> SessionError.ERROR_SESSION_NOT_AVAILABLE_IN_REGION
+                8 -> SessionError.ERROR_SESSION_CONTENT_ALREADY_PLAYING
+                9 -> SessionError.ERROR_SESSION_SKIP_LIMIT_REACHED
+                10 -> SessionError.INFO_CANCELLED                          // ACTION_ABORTED
+                11 -> SessionError.ERROR_SESSION_END_OF_PLAYLIST
+                else -> SessionError.ERROR_UNKNOWN
+            }
     }
 
     private fun parseCapabilities(capabilityStrings: ArrayList<String>?): List<Capability> {
@@ -1613,44 +1542,5 @@ class MusicService : HeadlessJsMediaService(), AudioManager.OnAudioFocusChangeLi
                 else -> null
             }
         } ?: emptyList()
-    }
-    
-    // MARK: - Audio Focus Handling
-    
-    override fun onAudioFocusChange(focusChange: Int) {
-        when (focusChange) {
-            AudioManager.AUDIOFOCUS_LOSS,
-            AudioManager.AUDIOFOCUS_LOSS_TRANSIENT,
-            AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK -> {
-                // Any loss of audio focus - emit simple begin event
-                if (interruptionStartTime == null) {
-                    interruptionStartTime = System.currentTimeMillis()
-                    trackPlayerModule?.onRemoteDuck(Bundle().apply {
-                        putString("reason", "began")
-                    })
-                }
-            }
-            AudioManager.AUDIOFOCUS_GAIN -> {
-                // Gained audio focus - emit simple end event
-                if (interruptionStartTime != null) {
-                    trackPlayerModule?.onRemoteDuck(Bundle().apply {
-                        putString("reason", "ended")
-                    })
-                    interruptionStartTime = null
-                }
-            }
-        }
-    }
-    
-    fun requestAudioFocus(): Boolean {
-        return audioManager?.requestAudioFocus(
-            this,
-            AudioManager.STREAM_MUSIC,
-            AudioManager.AUDIOFOCUS_GAIN
-        ) == AudioManager.AUDIOFOCUS_REQUEST_GRANTED
-    }
-    
-    fun abandonAudioFocus() {
-        audioManager?.abandonAudioFocus(this)
     }
 }

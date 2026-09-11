@@ -204,6 +204,10 @@ RCT_EXPORT_MODULE()
     [self emitOnPlaybackPlayWhenReadyChanged:event];
 }
 
+- (void)emitPlaybackStopAtReached:(NSDictionary *)event {
+    [self emitOnPlaybackStopAtReached:event];
+}
+
 - (void)emitRemotePlay {
     [self emitOnRemotePlay];
 }
@@ -356,6 +360,18 @@ RCT_EXPORT_MODULE()
 
 - (void)seekTo:(double)position resolve:(nonnull RCTPromiseResolveBlock)resolve reject:(nonnull RCTPromiseRejectBlock)reject {
     [_trackPlayer seekTo:position resolver:resolve rejecter:reject];
+}
+
+- (void)loadQueue:(nonnull NSArray *)tracks startIndex:(NSInteger)startIndex startPositionSec:(double)startPositionSec playWhenReady:(BOOL)playWhenReady resolve:(nonnull RCTPromiseResolveBlock)resolve reject:(nonnull RCTPromiseRejectBlock)reject {
+    [_trackPlayer loadQueue:tracks startIndex:@(startIndex) startPositionSec:startPositionSec playWhenReady:playWhenReady resolver:resolve rejecter:reject];
+}
+
+- (void)setStopAt:(double)positionSec resolve:(nonnull RCTPromiseResolveBlock)resolve reject:(nonnull RCTPromiseRejectBlock)reject {
+    [_trackPlayer setStopAt:positionSec resolver:resolve rejecter:reject];
+}
+
+- (void)clearStopAt:(nonnull RCTPromiseResolveBlock)resolve reject:(nonnull RCTPromiseRejectBlock)reject {
+    [_trackPlayer clearStopAt:resolve rejecter:reject];
 }
 
 - (void)setBrowseTree:(nonnull NSDictionary *)tree resolve:(nonnull RCTPromiseResolveBlock)resolve reject:(nonnull RCTPromiseRejectBlock)reject {

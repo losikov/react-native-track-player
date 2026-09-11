@@ -7,7 +7,7 @@ import com.doublesymmetry.kotlinaudio.models.AudioItemOptions
 import com.doublesymmetry.kotlinaudio.models.MediaType
 import com.doublesymmetry.trackplayer.utils.BundleUtils
 import com.doublesymmetry.trackplayer.utils.UriUtils
-import com.google.android.exoplayer2.upstream.RawResourceDataSource
+import androidx.media3.datasource.RawResourceDataSource
 import timber.log.Timber
 
 /**

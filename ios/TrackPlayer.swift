@@ -16,7 +16,12 @@ public class TrackPlayer: NSObject, AudioSessionControllerDelegate {
     // MARK: - Attributes
 
     private var hasInitialized = false
-    private let player = QueuedAudioPlayer()
+    /// The engine. `TrackPlayer` is one commander/subscriber of it now, not the owner of the queue:
+    /// native code in the app can drive and observe playback through `PlayerCore.shared` without a
+    /// React hop. Every bridged method and event below behaves exactly as it did before.
+    private let core = PlayerCore.shared
+    private var player: QueuedAudioPlayer { core.player }
+    private var observerTokens: [NSObjectProtocol] = []
     private let audioSessionController = AudioSessionController.shared
     private var shouldEmitProgressEvent: Bool = false
     private var shouldResumePlaybackAfterInterruptionEnds: Bool = false
@@ -45,6 +50,39 @@ public class TrackPlayer: NSObject, AudioSessionControllerDelegate {
         player.event.currentItem.addListener(self, handleAudioPlayerCurrentItemChange)
         player.event.secondElapse.addListener(self, handleAudioPlayerSecondElapse)
         player.event.playWhenReadyChange.addListener(self, handlePlayWhenReadyChange)
+
+        // A position jump no interval tick will report — a seek (including a seek while paused) and
+        // `loadQueue`. One progress event each, so JS's stored progress is never left holding the
+        // pre-seek position. This is the iOS half of the engine-level fix Android got in step 2.
+        observerTokens.append(
+            NotificationCenter.default.addObserver(
+                forName: PlayerCore.progressDidJump,
+                object: core,
+                queue: .main
+            ) { [weak self] note in
+                guard let self = self, self.shouldEmitProgressEvent else { return }
+                self.eventEmitter?.emitPlaybackProgressUpdated([
+                    "position": note.userInfo?["position"] as? Double ?? 0,
+                    "duration": note.userInfo?["duration"] as? Double ?? 0,
+                    "buffered": note.userInfo?["buffered"] as? Double ?? 0,
+                    "track": self.player.currentIndex,
+                ])
+            }
+        )
+
+        observerTokens.append(
+            NotificationCenter.default.addObserver(
+                forName: PlayerCore.stopAtReached,
+                object: core,
+                queue: .main
+            ) { [weak self] note in
+                // The ObjC selector `emitPlaybackStopAtReached:` imports into Swift split at the
+                // preposition, exactly like `emitPlaybackPlayWhenReadyChanged:` above it.
+                self?.eventEmitter?.emitPlaybackStop(atReached: [
+                    "position": note.userInfo?[PlayerCore.positionKey] as? Double ?? 0,
+                ])
+            }
+        )
     }
     
     @objc
@@ -53,6 +91,8 @@ public class TrackPlayer: NSObject, AudioSessionControllerDelegate {
     }
 
     deinit {
+        observerTokens.forEach { NotificationCenter.default.removeObserver($0) }
+        observerTokens.removeAll()
         reset(resolve: { _ in }, reject: { _, _, _  in })
     }
 
@@ -122,13 +162,16 @@ public class TrackPlayer: NSObject, AudioSessionControllerDelegate {
     public func handleInterruption(type: InterruptionType) {
         switch type {
         case .began:
-            // Interruption began - emit simple begin event
+            // The engine records this as a *suppression*, not a pause: the intent is untouched and
+            // `transport` stays `playing`. What the app does about it is `onRemoteDuck` in JS, which
+            // is unchanged — it still pauses and resumes.
+            core.noteInterruption(began: true)
             eventEmitter?.emitRemoteDuck([
                 "reason": "began"
             ])
             
-        case let .ended(shouldResume):
-            // Interruption ended - emit simple end event
+        case .ended:
+            core.noteInterruption(began: false)
             eventEmitter?.emitRemoteDuck([
                 "reason": "ended"
             ])
@@ -188,8 +231,18 @@ public class TrackPlayer: NSObject, AudioSessionControllerDelegate {
         configureAudioSession()
 
         // setup event listeners
+        //
+        // Step 4: pure transport — play, pause, stop, seek, jump ± — is applied on `PlayerCore`
+        // *here*, synchronously, and only then announced to JS, which records it (analytics, stored
+        // progress) without re-issuing it. See `TransportPolicy`. The player is therefore
+        // controllable from the lock screen, Control Center, a headphone remote and CarPlay whether
+        // or not the React context is alive. Next and previous are never applied here: JS owns what
+        // they mean (chapter navigation, the daily-date rule, the 20-second restart).
         player.remoteCommandController.handleChangePlaybackPositionCommand = { [weak self] event in
             if let event = event as? MPChangePlaybackPositionCommandEvent {
+                self?.applyNatively("seek to \(event.positionTime)") { core in
+                    core.seek(to: event.positionTime, reason: .remote)
+                }
                 self?.eventEmitter?.emitRemoteSeek(["position": event.positionTime])
                 return MPRemoteCommandHandlerStatus.success
             }
@@ -198,21 +251,25 @@ public class TrackPlayer: NSObject, AudioSessionControllerDelegate {
         }
 
         player.remoteCommandController.handleNextTrackCommand = { [weak self] _ in
+            NSLog("RNTP-Transport: routing next to JS (never applied natively)")
             self?.eventEmitter?.emitRemoteNext()
             return MPRemoteCommandHandlerStatus.success
         }
 
         player.remoteCommandController.handlePauseCommand = { [weak self] _ in
+            self?.applyNatively("pause") { core in core.pause(reason: .remote) }
             self?.eventEmitter?.emitRemotePause()
             return MPRemoteCommandHandlerStatus.success
         }
 
         player.remoteCommandController.handlePlayCommand = { [weak self] _ in
+            self?.applyNatively("play") { core in core.play(reason: .remote) }
             self?.eventEmitter?.emitRemotePlay()
             return MPRemoteCommandHandlerStatus.success
         }
 
         player.remoteCommandController.handlePreviousTrackCommand = { [weak self] _ in
+            NSLog("RNTP-Transport: routing previous to JS (never applied natively)")
             self?.eventEmitter?.emitRemotePrevious()
             return MPRemoteCommandHandlerStatus.success
         }
@@ -220,6 +277,9 @@ public class TrackPlayer: NSObject, AudioSessionControllerDelegate {
         player.remoteCommandController.handleSkipBackwardCommand = { [weak self] event in
             if let command = event.command as? MPSkipIntervalCommand,
                let interval = command.preferredIntervals.first {
+                self?.applyNatively("jump back \(interval.doubleValue)s") { core in
+                    core.seek(by: -interval.doubleValue, reason: .remote)
+                }
                 self?.eventEmitter?.emitRemoteJumpBackward(["interval": interval])
                 return MPRemoteCommandHandlerStatus.success
             }
@@ -230,6 +290,9 @@ public class TrackPlayer: NSObject, AudioSessionControllerDelegate {
         player.remoteCommandController.handleSkipForwardCommand = { [weak self] event in
             if let command = event.command as? MPSkipIntervalCommand,
                let interval = command.preferredIntervals.first {
+                self?.applyNatively("jump forward \(interval.doubleValue)s") { core in
+                    core.seek(by: interval.doubleValue, reason: .remote)
+                }
                 self?.eventEmitter?.emitRemoteJumpForward(["interval": interval])
                 return MPRemoteCommandHandlerStatus.success
             }
@@ -238,15 +301,23 @@ public class TrackPlayer: NSObject, AudioSessionControllerDelegate {
         }
 
         player.remoteCommandController.handleStopCommand = { [weak self] _ in
+            self?.applyNatively("stop") { core in core.stop(reason: .remote) }
             self?.eventEmitter?.emitRemoteStop()
             return MPRemoteCommandHandlerStatus.success
         }
 
         player.remoteCommandController.handleTogglePlayPauseCommand = { [weak self] _ in
-            if self?.player.playerState == .paused {
-                self?.eventEmitter?.emitRemotePlay()
+            guard let self = self else { return MPRemoteCommandHandlerStatus.success }
+            // Which way to toggle is decided on the *intent*, not on `playerState`, because the
+            // engine is what acts on it now: a track still loading has `playerState == .loading`
+            // with `playWhenReady == true`, and a toggle then has to pause. (This is also the
+            // decision media3's session makes on Android.)
+            if self.core.snapshot.playWhenReady {
+                self.applyNatively("toggle -> pause") { core in core.pause(reason: .remote) }
+                self.eventEmitter?.emitRemotePause()
             } else {
-                self?.eventEmitter?.emitRemotePause()
+                self.applyNatively("toggle -> play") { core in core.play(reason: .remote) }
+                self.eventEmitter?.emitRemotePlay()
             }
 
             return MPRemoteCommandHandlerStatus.success
@@ -269,6 +340,20 @@ public class TrackPlayer: NSObject, AudioSessionControllerDelegate {
 
         hasInitialized = true
         resolve(NSNull())
+    }
+
+    /// Run `command` on the engine when the policy says so, and say so in the log.
+    ///
+    /// The position is logged either side because that is the only way to see, from a device, that a
+    /// jump moved exactly one interval and did not compound with a JS-issued one.
+    private func applyNatively(_ label: String, _ command: (PlayerCore) -> Void) {
+        guard core.transportPolicy == .applyNativelyAndNotify else {
+            NSLog("RNTP-Transport: routing \(label) to JS (policy: routeToListeners)")
+            return
+        }
+        let before = core.position
+        command(core)
+        NSLog("RNTP-Transport: applied \(label) natively: \(before) -> \(core.position)")
     }
 
     private func updateCategory(config: [String: Any]) {
@@ -477,14 +562,10 @@ public class TrackPlayer: NSObject, AudioSessionControllerDelegate {
         if (rejectWhenNotInitialized(reject: reject)) { return }
 
         print("Skipping to track:", index)
-        try? player.jumpToItem(atIndex: index, playWhenReady: player.playerState == .playing)
-
-        // if an initialTime is passed the seek to it
-        if (initialTime >= 0) {
-            self.seekTo(time: initialTime, resolve: resolve, reject: reject)
-        } else {
-            resolve(NSNull())
-        }
+        // One call, so the snapshot carries the target position from the start: the old
+        // jump-then-seek pair let a progress tick report 0 in between.
+        try? core.skip(to: index, position: initialTime >= 0 ? initialTime : nil)
+        resolve(NSNull())
     }
 
     @objc(skipToNext:resolver:rejecter:)
@@ -495,7 +576,7 @@ public class TrackPlayer: NSObject, AudioSessionControllerDelegate {
     ) {
         if (rejectWhenNotInitialized(reject: reject)) { return }
 
-        player.next()
+        core.next()
 
         // if an initialTime is passed the seek to it
         if (initialTime >= 0) {
@@ -513,7 +594,7 @@ public class TrackPlayer: NSObject, AudioSessionControllerDelegate {
     ) {
         if (rejectWhenNotInitialized(reject: reject)) { return }
 
-        player.previous()
+        core.previous()
 
         // if an initialTime is passed the seek to it
         if (initialTime >= 0) {
@@ -527,15 +608,16 @@ public class TrackPlayer: NSObject, AudioSessionControllerDelegate {
     public func reset(resolve: RCTPromiseResolveBlock, reject: RCTPromiseRejectBlock) {
         if (rejectWhenNotInitialized(reject: reject)) { return }
 
-        player.stop()
+        core.stop()
         player.clear()
+        core.publishSnapshot()
         resolve(NSNull())
     }
 
     @objc(play:rejecter:)
     public func play(resolve: RCTPromiseResolveBlock, reject: RCTPromiseRejectBlock) {
         if (rejectWhenNotInitialized(reject: reject)) { return }
-        player.play()
+        core.play()
         resolve(NSNull())
     }
 
@@ -543,14 +625,14 @@ public class TrackPlayer: NSObject, AudioSessionControllerDelegate {
     public func pause(resolve: RCTPromiseResolveBlock, reject: RCTPromiseRejectBlock) {
         if (rejectWhenNotInitialized(reject: reject)) { return }
 
-        player.pause()
+        core.pause()
         resolve(NSNull())
     }
 
     @objc(setPlayWhenReady:resolver:rejecter:)
     public func setPlayWhenReady(playWhenReady: Bool, resolve: RCTPromiseResolveBlock, reject: RCTPromiseRejectBlock) {
         if (rejectWhenNotInitialized(reject: reject)) { return }
-        player.playWhenReady = playWhenReady
+        core.setPlayWhenReady(playWhenReady)
         resolve(NSNull())
     }
 
@@ -564,7 +646,7 @@ public class TrackPlayer: NSObject, AudioSessionControllerDelegate {
     public func stop(resolve: RCTPromiseResolveBlock, reject: RCTPromiseRejectBlock) {
         if (rejectWhenNotInitialized(reject: reject)) { return }
 
-        player.stop()
+        core.stop()
         resolve(NSNull())
     }
 
@@ -572,7 +654,7 @@ public class TrackPlayer: NSObject, AudioSessionControllerDelegate {
     public func seekTo(time: Double, resolve: RCTPromiseResolveBlock, reject: RCTPromiseRejectBlock) {
         if (rejectWhenNotInitialized(reject: reject)) { return }
 
-        player.seek(to: time)
+        core.seek(to: time)
         resolve(NSNull())
     }
 
@@ -580,7 +662,69 @@ public class TrackPlayer: NSObject, AudioSessionControllerDelegate {
     public func seekBy(offset: Double, resolve: RCTPromiseResolveBlock, reject: RCTPromiseRejectBlock) {
         if (rejectWhenNotInitialized(reject: reject)) { return }
 
-        player.seek(by: offset)
+        core.seek(by: offset)
+        resolve(NSNull())
+    }
+
+    /// Replace the queue, the index and the position in one call. See `PlayerCore.loadQueue`.
+    @objc(loadQueue:startIndex:startPositionSec:playWhenReady:resolver:rejecter:)
+    public func loadQueue(
+        trackDicts: [[String: Any]],
+        startIndex: NSNumber,
+        startPositionSec: Double,
+        playWhenReady: Bool,
+        resolve: RCTPromiseResolveBlock,
+        reject: RCTPromiseRejectBlock
+    ) {
+        if (rejectWhenNotInitialized(reject: reject)) { return }
+
+        var tracks = [Track]()
+        for trackDict in trackDicts {
+            guard let track = Track(dictionary: trackDict) else {
+                reject("invalid_track_object", "Track is missing a required key", nil)
+                return
+            }
+            tracks.append(track)
+        }
+
+        if tracks.isEmpty {
+            reject("invalid_parameter", "The track list is empty", nil)
+            return
+        }
+
+        let index = startIndex.intValue
+        if index < 0 || index >= tracks.count {
+            reject("index_out_of_bounds", "The track index is out of bounds", nil)
+            return
+        }
+
+        do {
+            try core.loadQueue(
+                items: tracks,
+                startIndex: index,
+                startPosition: startPositionSec,
+                playWhenReady: playWhenReady
+            )
+        } catch {
+            reject("runtime_exception", error.localizedDescription, error)
+            return
+        }
+        resolve(NSNull())
+    }
+
+    @objc(setStopAt:resolver:rejecter:)
+    public func setStopAt(positionSec: Double, resolve: RCTPromiseResolveBlock, reject: RCTPromiseRejectBlock) {
+        if (rejectWhenNotInitialized(reject: reject)) { return }
+
+        core.setStopAt(positionSec)
+        resolve(NSNull())
+    }
+
+    @objc(clearStopAt:rejecter:)
+    public func clearStopAt(resolve: RCTPromiseResolveBlock, reject: RCTPromiseRejectBlock) {
+        if (rejectWhenNotInitialized(reject: reject)) { return }
+
+        core.clearStopAt()
         resolve(NSNull())
     }
 
@@ -625,7 +769,7 @@ public class TrackPlayer: NSObject, AudioSessionControllerDelegate {
     public func setRate(rate: Float, resolve: RCTPromiseResolveBlock, reject: RCTPromiseRejectBlock) {
         if (rejectWhenNotInitialized(reject: reject)) { return }
 
-        player.rate = rate
+        core.setRate(rate)
         resolve(NSNull())
     }
 
@@ -721,16 +865,16 @@ public class TrackPlayer: NSObject, AudioSessionControllerDelegate {
     public func getPosition(resolve: RCTPromiseResolveBlock, reject: RCTPromiseRejectBlock) {
         if (rejectWhenNotInitialized(reject: reject)) { return }
 
-        resolve(player.currentTime)
+        resolve(core.position)
     }
 
     @objc(getProgress:rejecter:)
     public func getProgress(resolve: RCTPromiseResolveBlock, reject: RCTPromiseRejectBlock) {
         if (rejectWhenNotInitialized(reject: reject)) { return }
         resolve([
-            "position": player.currentTime,
-            "duration": player.duration,
-            "buffered": player.bufferedPosition
+            "position": core.position,
+            "duration": core.duration,
+            "buffered": core.bufferedPosition
         ])
     }
 
@@ -775,36 +919,25 @@ public class TrackPlayer: NSObject, AudioSessionControllerDelegate {
     }
 
     private func getPlaybackStateErrorKeyValues() -> Dictionary<String, Any> {
-        switch player.playbackError {
-            case .failedToLoadKeyValue: return [
-                "message": "Failed to load resource",
-                "code": "ios_failed_to_load_resource"
-            ]
-            case .invalidSourceUrl: return [
-                "message": "The source url was invalid",
-                "code": "ios_invalid_source_url"
-            ]
-            case .notConnectedToInternet: return [
-                "message": "A network resource was requested, but an internet connection has not been established and can’t be established automatically.",
-                "code": "ios_not_connected_to_internet"
-            ]
-            case .playbackFailed: return [
-                "message": "Playback of the track failed",
-                "code": "ios_playback_failed"
-            ]
-            case .itemWasUnplayable: return [
-                "message": "The track could not be played",
-                "code": "ios_track_unplayable"
-            ]
-            default: return [
-                "message": "A playback error occurred",
-                "code": "ios_playback_error"
-            ]
+        // The mapping itself lives in `PlayerCore` so the snapshot's `error` and this payload's
+        // cannot drift apart. Same codes and messages as before.
+        guard let info = PlaybackErrorInfo.from(player.playbackError) else {
+            return ["message": "A playback error occurred", "code": "ios_playback_error"]
         }
+        return ["message": info.message, "code": info.code]
     }
 
+    /// The `onPlaybackState` payload and `getPlaybackState()` return value.
+    ///
+    /// `state` and `error` are exactly what they were. Everything else is the `PlayerSnapshot`
+    /// `TrackPlayerModule.kt` already sends on Android: `transport` is what the play/pause button
+    /// binds to, and it does not flicker through readiness.
+    ///
+    /// The snapshot is re-derived here rather than read off the stored value, so it cannot matter
+    /// whether `PlayerCore`'s own listener or this one ran first for the event being reported.
     private func getPlaybackStateBodyKeyValues(state: AudioPlayerState) -> Dictionary<String, Any> {
-        var body: Dictionary<String, Any> = ["state": State.fromPlayerState(state: state).rawValue]
+        var body = core.publishSnapshot().asDictionary()
+        body["state"] = State.fromPlayerState(state: state).rawValue
         if (state == AudioPlayerState.failed) {
             body["error"] = getPlaybackStateErrorKeyValues()
         }
@@ -814,7 +947,21 @@ public class TrackPlayer: NSObject, AudioSessionControllerDelegate {
     // MARK: - QueuedAudioPlayer Event Handlers
 
     func handleAudioPlayerStateChange(state: AVPlayerWrapperState) {
-        eventEmitter?.emitPlaybackState(getPlaybackStateBodyKeyValues(state: state))
+        let body = getPlaybackStateBodyKeyValues(state: state)
+        // The Android half of this line is `TrackPlayerModule.onPlaybackState`. `transport` is what
+        // the JS button binds to as of step 3, and "did the button ever leave pause during this
+        // load" is a question you answer from this line.
+        NSLog(
+            "🎵 TrackPlayer.onPlaybackState: state=%@ transport=%@ readiness=%@ reason=%@ playWhenReady=%@ isPlaying=%@ suppression=%@",
+            String(describing: body["state"] ?? ""),
+            String(describing: body["transport"] ?? ""),
+            String(describing: body["readiness"] ?? ""),
+            String(describing: body["reason"] ?? ""),
+            String(describing: body["playWhenReady"] ?? ""),
+            String(describing: body["isPlaying"] ?? ""),
+            String(describing: body["suppression"] ?? "")
+        )
+        eventEmitter?.emitPlaybackState(body)
         
         // Set playbackState for macOS/CarPlay simulator compatibility
         // SwiftAudioEx automatically handles playbackRate and elapsedPlaybackTime updates
@@ -926,9 +1073,9 @@ public class TrackPlayer: NSObject, AudioSessionControllerDelegate {
         // we may need to re-enable manual updates via nowPlayingInfoController.set()
         
         eventEmitter?.emitPlaybackProgressUpdated([
-            "position": player.currentTime,
-            "duration": player.duration,
-            "buffered": player.bufferedPosition,
+            "position": core.position,
+            "duration": core.duration,
+            "buffered": core.bufferedPosition,
             "track": player.currentIndex,
         ])
     }

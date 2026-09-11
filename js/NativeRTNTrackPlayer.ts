@@ -272,6 +272,44 @@ export interface PlayerOptions {
   androidAudioFocusGainType?: 'gain' | 'gainTransient' | 'gainTransientMayDuck';
 }
 
+/**
+ * The engine state model ("PlayerCore").
+ *
+ * `state` above stays exactly what it always was — a mirror of raw player readiness, which is why a
+ * button bound to it flickers LOADING -> READY -> BUFFERING -> PLAYING on every load. These fields
+ * ride alongside it in the same `onPlaybackState` payload and in `getPlaybackState()`. Both
+ * platforms fill them in as of step 3 (Android from `PlayerSnapshot`, iOS from `PlayerCore.swift`);
+ * they stay optional so a JS build running against an older native binary still type-checks, and
+ * `AudioPlayer.handlePlaybackState` keeps a fallback for that case.
+ */
+export type PlaybackTransport = 'playing' | 'paused' | 'ended' | 'error';
+export type PlaybackReadiness = 'idle' | 'loading' | 'buffering' | 'ready' | 'ended';
+export type PlaybackTransportReason =
+  | 'user'
+  | 'remote'
+  | 'error'
+  | 'end_of_queue'
+  | 'audio_focus_loss'
+  | 'stop_at'
+  | 'system';
+export type PlaybackSuppression = 'none' | 'transient_audio_focus_loss' | 'unsuitable_output';
+
+export interface PlaybackStateSnapshot {
+  state: PlaybackState;
+  error?: PlaybackErrorEvent;
+  /** The raw intent: what `play()`/`pause()` last asked for. */
+  playWhenReady?: boolean;
+  /** Whether sound is actually coming out right now. */
+  isPlaying?: boolean;
+  /** What the play/pause button should show. */
+  transport?: PlaybackTransport;
+  readiness?: PlaybackReadiness;
+  /** Why `transport` last changed. */
+  reason?: PlaybackTransportReason;
+  /** Playback is intended but held back by the system (a phone call, an unsuitable output). */
+  suppression?: PlaybackSuppression;
+}
+
 export interface Spec extends TurboModule {
   // Setup and configuration
   setupPlayer(options: PlayerOptions): Promise<void>;
@@ -287,7 +325,30 @@ export interface Spec extends TurboModule {
   stop(): Promise<void>;
   reset(): Promise<void>;
   seekTo(position: number): Promise<void>;
-  
+
+  /**
+   * Replace the queue, the index and the position in one call, then apply the intent.
+   *
+   * The replacement for `reset()` + `add()` + `skip(index, position)` (+ `play()`). Loading used to
+   * be two or three round trips, so the engine emitted a media-item transition and a progress tick
+   * at position 0 before the seek landed, and JS wrote that 0 to stored progress. Here the start
+   * position is part of the load: no event can report 0 before the target.
+   *
+   * `startPositionSec <= 0` means "from the beginning".
+   */
+  loadQueue(tracks: Array<Track>, startIndex: Int32, startPositionSec: Double, playWhenReady: boolean): Promise<void>;
+
+  /**
+   * Arm a pending stop: when playback reaches `positionSec` in the current track, the engine pauses
+   * with reason `stop_at`, never auto-advances, and emits {@link Spec.onPlaybackStopAtReached}.
+   *
+   * Cleared by {@link Spec.clearStopAt} and by ANY seek, skip, load or `loadQueue`.
+   */
+  setStopAt(positionSec: Double): Promise<void>;
+
+  /** Disarm a pending {@link Spec.setStopAt}. A no-op when nothing is armed. */
+  clearStopAt(): Promise<void>;
+
   // Volume and rate
   setVolume(volume: number): Promise<void>;
   getVolume(): Promise<number>;
@@ -328,7 +389,7 @@ export interface Spec extends TurboModule {
   getRepeatMode(): Promise<number>;
   
   // Advanced playback
-  getPlaybackState(): Promise<{ state: PlaybackState; error?: PlaybackErrorEvent }>;
+  getPlaybackState(): Promise<PlaybackStateSnapshot>;
   getPlaybackRate(): Promise<number>;
   setPlaybackRate(rate: number): Promise<void>;
   getPlayWhenReady(): Promise<boolean>;
@@ -348,12 +409,14 @@ export interface Spec extends TurboModule {
   sendSearchResults(searchId: string, results: Array<{ mediaId: string; title: string; artist?: string; album?: string; artwork?: string; url?: string; duration?: number }>): Promise<void>;
   
   // Event emitters
-  readonly onPlaybackState: EventEmitter<{ state: PlaybackState; error?: PlaybackErrorEvent }>;
+  readonly onPlaybackState: EventEmitter<PlaybackStateSnapshot>;
   readonly onPlaybackProgressUpdated: EventEmitter<Progress>;
   readonly onPlaybackQueueEnded: EventEmitter<PlaybackQueueEndedEvent>;
   readonly onPlaybackError: EventEmitter<PlaybackErrorEvent>;
   readonly onPlaybackActiveTrackChanged: EventEmitter<PlaybackActiveTrackChangedEvent>;
   readonly onPlaybackPlayWhenReadyChanged: EventEmitter<{ playWhenReady: boolean }>;
+  /** Playback reached the position armed by {@link Spec.setStopAt} and the engine paused there. */
+  readonly onPlaybackStopAtReached: EventEmitter<{ position: number }>;
 
   // Remote control events
   readonly onRemotePlay: EventEmitter<void>;

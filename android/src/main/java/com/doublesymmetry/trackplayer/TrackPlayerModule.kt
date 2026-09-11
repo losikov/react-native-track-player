@@ -2,16 +2,15 @@ package com.doublesymmetry.trackplayer
 
 import android.content.*
 import android.content.Context
-import android.media.MediaDescription
 import android.os.Build
 import android.os.Bundle
 import android.os.IBinder
 import android.net.Uri
-import android.support.v4.media.RatingCompat
-import android.support.v4.media.MediaBrowserCompat.MediaItem
-import android.support.v4.media.MediaDescriptionCompat
 import androidx.localbroadcastmanager.content.LocalBroadcastManager
-import androidx.media.utils.MediaConstants
+import androidx.media3.common.MediaItem
+import androidx.media3.common.MediaMetadata
+import androidx.media3.common.util.UnstableApi
+import androidx.media3.session.MediaConstants
 import com.doublesymmetry.kotlinaudio.models.Capability
 import com.doublesymmetry.kotlinaudio.models.RepeatMode
 import com.doublesymmetry.trackplayer.extensions.NumberExt.Companion.toMilliseconds
@@ -25,8 +24,6 @@ import com.doublesymmetry.trackplayer.utils.AppForegroundTracker
 import com.doublesymmetry.trackplayer.utils.RejectionException
 import com.doublesymmetry.trackplayer.utils.UriUtils
 import com.facebook.react.bridge.*
-import com.google.android.exoplayer2.DefaultLoadControl.*
-import com.google.android.exoplayer2.Player
 import kotlinx.coroutines.MainScope
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
@@ -39,6 +36,7 @@ import javax.annotation.Nonnull
  * TurboModule implementation for react-native-track-player
  * This provides New Architecture support with full functionality from MusicModule
  */
+@UnstableApi
 class TrackPlayerModule(
     private val reactContext: ReactApplicationContext
 ) : NativeRTNTrackPlayerSpec(reactContext), ServiceConnection, MusicServiceEventListener {
@@ -47,6 +45,9 @@ class TrackPlayerModule(
         const val NAME = "RTNTrackPlayer"
         const val EVENT_INTENT = "com.doublesymmetry.trackplayer.event"
         
+        /** `android.media.MediaMetadata.METADATA_KEY_MEDIA_TYPE`, which is not a public constant. */
+        private const val LEGACY_METADATA_KEY_MEDIA_TYPE = "android.media.metadata.MEDIA_TYPE"
+
         // Buffer constants
         private const val DEFAULT_MIN_BUFFER_MS = 15000
         private const val DEFAULT_MAX_BUFFER_MS = 50000
@@ -198,17 +199,16 @@ class TrackPlayerModule(
             
             // Always bind service early to ensure TrackPlayerModule connects even if setupPlayer() fails
             Intent(context, MusicService::class.java).also { intent ->
-                // Starting a foreground service from the background throws
-                // ForegroundServiceStartNotAllowedException on Android 12+. When backgrounded we only
-                // bind (BIND_AUTO_CREATE still creates the service), which is all Android Auto needs;
-                // the service promotes itself to the foreground once playback actually starts.
+                // startService, not startForegroundService. On the ExoPlayer 2 build the service
+                // answered a foreground start by posting and immediately cancelling an empty
+                // notification, purely to satisfy the 5-second startForeground() deadline
+                // (`startAndStopEmptyNotificationToAvoidANR`). media3 posts the notification when
+                // playback actually starts and promotes the service itself at that point, so there
+                // is nothing to satisfy the deadline with — and nothing that needs to. This branch
+                // only runs while the app is in the foreground, where startService is allowed.
                 if (!isBackgrounded) {
                     try {
-                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                            context.startForegroundService(intent)
-                        } else {
-                            context.startService(intent)
-                        }
+                        context.startService(intent)
                     } catch (e: IllegalStateException) {
                         // The process may have been backgrounded between the check above and this call,
                         // or the app may be under a background-start restriction we can't observe.
@@ -314,99 +314,118 @@ class TrackPlayerModule(
         }.filterNotNull().toMutableList()
     }
 
+    /**
+     * A browse-tree node, as a media3 [MediaItem].
+     *
+     * Every extras key is the one the ExoPlayer 2 build used — `androidx.media.utils.MediaConstants`
+     * and `androidx.media3.session.MediaConstants` carry the same strings — so Android Auto reads
+     * the same content styles, grouping subheadings and playback-progress hints it always did. Only
+     * the container moved: `MediaDescriptionCompat.extras` became `MediaMetadata.extras`, and the
+     * browsable/playable flag became `MediaMetadata.isBrowsable` / `isPlayable`.
+     */
     private fun hashmapToMediaItem(hashmap: HashMap<String, String>): MediaItem {
-        val mediaId = hashmap["mediaId"]
+        val mediaId = hashmap["mediaId"] ?: ""
         val title = hashmap["title"]
         val subtitle = hashmap["subtitle"]
         val mediaUri = hashmap["mediaUri"]
         val iconUri = hashmap["iconUri"]
-        val playableFlag = if (hashmap["playable"]?.toInt() == 1) MediaItem.FLAG_BROWSABLE else MediaItem.FLAG_PLAYABLE
+        // Unchanged, including the inversion: "1" means browsable (MediaItemPlayable.MediaBrowsable).
+        val isBrowsable = hashmap["playable"]?.toIntOrNull() == 1
 
-        val mediaDescriptionBuilder = MediaDescriptionCompat.Builder()
-        mediaDescriptionBuilder.setMediaId(mediaId)
-        mediaDescriptionBuilder.setTitle(title)
-        mediaDescriptionBuilder.setSubtitle(subtitle)
-        mediaDescriptionBuilder.setMediaUri(if (mediaUri != null) Uri.parse(mediaUri) else null)
-        
-        // Convert URIs for Android Auto compatibility
-        // Android Auto requires content:// URIs for grid artwork, not HTTP/HTTPS URLs
-        // For file:// URIs, convert to content:// via ImageContentProvider
-        // For HTTP/HTTPS URLs, check if cached locally and convert to content://, otherwise log warning
-        iconUri?.let {
-            val uri = Uri.parse(it)
-            val finalIconUri = when {
-                uri.scheme == "file" -> {
-                    // Convert file:// to content://
-                    val convertedIconUri = UriUtils.convertFileUriToContentUri(reactContext, it)
-                    if (convertedIconUri != null) {
-                        Uri.parse(convertedIconUri)
-                    } else {
-                        Timber.tag("RNTP-AA").w("Failed to convert file:// URI, using original: $it")
-                        uri
-                    }
-                }
-                uri.scheme == "http" || uri.scheme == "https" -> {
-                    // For HTTPS URLs, try to find cached version and convert to content://
-                    // Android Auto requires content:// URIs for grid items, not HTTP/HTTPS
-                    val cachedUri = UriUtils.convertHttpUriToContentUri(reactContext, it)
-                    if (cachedUri != null) {
-                        Uri.parse(cachedUri)
-                    } else {
-                        Timber.tag("RNTP-AA").w("HTTPS URL not cached locally - Android Auto may not display this image: $it")
-                        Timber.tag("RNTP-AA").w("Consider downloading and caching images before setting iconUri for grid items")
-                        uri // Fallback to HTTPS URL (may not work in Android Auto)
-                    }
-                }
-                else -> uri
-            }
-            mediaDescriptionBuilder.setIconUri(finalIconUri)
-        }
         val extras = Bundle()
         hashmap["groupTitle"]?.let {
-            extras.putString(
-                MediaConstants.DESCRIPTION_EXTRAS_KEY_CONTENT_STYLE_GROUP_TITLE, it)
+            extras.putString(MediaConstants.EXTRAS_KEY_CONTENT_STYLE_GROUP_TITLE, it)
         }
-        hashmap["contentStyle"]?.toInt()?.let {
-            extras.putInt(
-                MediaConstants.DESCRIPTION_EXTRAS_KEY_CONTENT_STYLE_SINGLE_ITEM, it)
+        hashmap["contentStyle"]?.toIntOrNull()?.let {
+            extras.putInt(MediaConstants.EXTRAS_KEY_CONTENT_STYLE_SINGLE_ITEM, it)
         }
-        hashmap["childrenPlayableContentStyle"]?.toInt()?.let {
-            extras.putInt(
-                MediaConstants.DESCRIPTION_EXTRAS_KEY_CONTENT_STYLE_PLAYABLE, it)
+        hashmap["childrenPlayableContentStyle"]?.toIntOrNull()?.let {
+            extras.putInt(MediaConstants.EXTRAS_KEY_CONTENT_STYLE_PLAYABLE, it)
         }
-        hashmap["childrenBrowsableContentStyle"]?.toInt()?.let {
-            extras.putInt(
-                MediaConstants.DESCRIPTION_EXTRAS_KEY_CONTENT_STYLE_BROWSABLE, it)
+        hashmap["childrenBrowsableContentStyle"]?.toIntOrNull()?.let {
+            extras.putInt(MediaConstants.EXTRAS_KEY_CONTENT_STYLE_BROWSABLE, it)
         }
 
         // playbackProgress should contain a string representation of a number between 0 and 1 if present
-        hashmap["playbackProgress"]?.toDouble()?.let {
+        hashmap["playbackProgress"]?.toDoubleOrNull()?.let {
             if (it > 0.98) {
                 extras.putInt(
-                    MediaConstants.DESCRIPTION_EXTRAS_KEY_COMPLETION_STATUS,
-                    MediaConstants.DESCRIPTION_EXTRAS_VALUE_COMPLETION_STATUS_FULLY_PLAYED)
+                    MediaConstants.EXTRAS_KEY_COMPLETION_STATUS,
+                    MediaConstants.EXTRAS_VALUE_COMPLETION_STATUS_FULLY_PLAYED
+                )
             } else if (it == 0.0) {
                 extras.putInt(
-                    MediaConstants.DESCRIPTION_EXTRAS_KEY_COMPLETION_STATUS,
-                    MediaConstants.DESCRIPTION_EXTRAS_VALUE_COMPLETION_STATUS_NOT_PLAYED)
+                    MediaConstants.EXTRAS_KEY_COMPLETION_STATUS,
+                    MediaConstants.EXTRAS_VALUE_COMPLETION_STATUS_NOT_PLAYED
+                )
             } else {
                 extras.putInt(
-                    MediaConstants.DESCRIPTION_EXTRAS_KEY_COMPLETION_STATUS,
-                    MediaConstants.DESCRIPTION_EXTRAS_VALUE_COMPLETION_STATUS_PARTIALLY_PLAYED)
-                extras.putDouble(
-                    MediaConstants.DESCRIPTION_EXTRAS_KEY_COMPLETION_PERCENTAGE, it)
+                    MediaConstants.EXTRAS_KEY_COMPLETION_STATUS,
+                    MediaConstants.EXTRAS_VALUE_COMPLETION_STATUS_PARTIALLY_PLAYED
+                )
+                extras.putDouble(MediaConstants.EXTRAS_KEY_COMPLETION_PERCENTAGE, it)
             }
         }
 
-        // MEDIA_TYPE: Add media type to extras for Google Assistant recommendations
-        // mediaType is required in TypeScript, but we default to AUDIOBOOK for safety
-        // Use string key directly as MediaConstants doesn't have METADATA_KEY_MEDIA_TYPE in ExoPlayer 2.19.1
+        // MEDIA_TYPE for Google Assistant recommendations. The raw legacy int is kept in the extras
+        // under the key legacy browsers read, and media3's own media type is set alongside it.
         val mediaTypeString = hashmap["mediaType"] ?: "AUDIO_BOOK"
-        val mediaType = mapContentTypeToMediaConstant(mediaTypeString)
-        extras.putInt("android.media.metadata.MEDIA_TYPE", mediaType)
+        extras.putInt(LEGACY_METADATA_KEY_MEDIA_TYPE, mapContentTypeToMediaConstant(mediaTypeString))
 
-        mediaDescriptionBuilder.setExtras(extras)
-        return MediaItem(mediaDescriptionBuilder.build(), playableFlag)
+        val metadata = MediaMetadata.Builder()
+            .setTitle(title)
+            .setSubtitle(subtitle)
+            .setIsBrowsable(isBrowsable)
+            .setIsPlayable(!isBrowsable)
+            .setMediaType(mapContentTypeToMedia3Type(mediaTypeString))
+            .setExtras(extras)
+
+        // Convert URIs for Android Auto compatibility: it reads artwork across a process boundary,
+        // so file:// in our private storage is unreadable and http(s):// may not be fetched at all.
+        iconUri?.let { metadata.setArtworkUri(browsableUri(it)) }
+
+        val builder = MediaItem.Builder()
+            .setMediaId(mediaId)
+            .setMediaMetadata(metadata.build())
+        if (mediaUri != null) {
+            builder.setRequestMetadata(
+                MediaItem.RequestMetadata.Builder().setMediaUri(Uri.parse(mediaUri)).build()
+            )
+        }
+        return builder.build()
+    }
+
+    private fun browsableUri(raw: String): Uri {
+        val uri = Uri.parse(raw)
+        return when (uri.scheme) {
+            "file" -> {
+                val converted = UriUtils.convertFileUriToContentUri(reactContext, raw)
+                if (converted != null) Uri.parse(converted) else {
+                    Timber.tag("RNTP-AA").w("Failed to convert file:// URI, using original: $raw")
+                    uri
+                }
+            }
+            "http", "https" -> {
+                val cached = UriUtils.convertHttpUriToContentUri(reactContext, raw)
+                if (cached != null) Uri.parse(cached) else {
+                    Timber.tag("RNTP-AA").w("HTTPS URL not cached locally - Android Auto may not display this image: $raw")
+                    Timber.tag("RNTP-AA").w("Consider downloading and caching images before setting iconUri for grid items")
+                    uri
+                }
+            }
+            else -> uri
+        }
+    }
+
+    /** media3's own media type, alongside the legacy int above. */
+    private fun mapContentTypeToMedia3Type(contentType: String): Int = when (contentType.uppercase()) {
+        "MUSIC" -> MediaMetadata.MEDIA_TYPE_MUSIC
+        "ALBUM" -> MediaMetadata.MEDIA_TYPE_ALBUM
+        "ARTIST" -> MediaMetadata.MEDIA_TYPE_ARTIST
+        "PLAYLIST" -> MediaMetadata.MEDIA_TYPE_PLAYLIST
+        "PODCAST_EPISODE" -> MediaMetadata.MEDIA_TYPE_PODCAST_EPISODE
+        "RADIO_STATION" -> MediaMetadata.MEDIA_TYPE_RADIO_STATION
+        else -> MediaMetadata.MEDIA_TYPE_AUDIO_BOOK
     }
 
     /**
@@ -658,6 +677,69 @@ class TrackPlayerModule(
             if (verifyServiceBoundOrReject(promise)) return@launch
             try {
                 musicService.seekTo(position.toFloat())
+                promise.resolve(null)
+            } catch (exception: Exception) {
+                promise.reject("runtime_exception", exception.message, exception)
+            }
+        }
+    }
+
+    /**
+     * Replace the queue, the index and the start position in one call — the bridge half of
+     * [com.doublesymmetry.kotlinaudio.players.BaseAudioPlayer.loadQueue].
+     *
+     * This is what JS's `loadTracksAndSeekToCurrent` calls instead of `reset()` + `add()` +
+     * `skip(index, position)`: the start position is part of the load, so no progress or
+     * track-changed event can report 0 before the target.
+     */
+    override fun loadQueue(
+        tracks: ReadableArray,
+        startIndex: Double,
+        startPositionSec: Double,
+        playWhenReady: Boolean,
+        promise: Promise
+    ) {
+        Timber.d("🎵 TurboModule loadQueue() called with ${tracks.size()} tracks, startIndex: $startIndex, startPositionSec: $startPositionSec, playWhenReady: $playWhenReady")
+        scope.launch {
+            if (verifyServiceBoundOrReject(promise)) return@launch
+            try {
+                val trackList = readableArrayToTrackList(tracks)
+                if (trackList.isEmpty()) {
+                    promise.reject("invalid_parameter", "The track list is empty")
+                    return@launch
+                }
+                val index = startIndex.toInt()
+                if (index < 0 || index >= trackList.size) {
+                    promise.reject("index_out_of_bounds", "The track index is out of bounds")
+                    return@launch
+                }
+                musicService.loadQueue(trackList, index, startPositionSec, playWhenReady)
+                promise.resolve(null)
+            } catch (exception: Exception) {
+                promise.reject("runtime_exception", exception.message, exception)
+            }
+        }
+    }
+
+    override fun setStopAt(positionSec: Double, promise: Promise) {
+        Timber.d("🎵 TurboModule setStopAt() called with position: $positionSec")
+        scope.launch {
+            if (verifyServiceBoundOrReject(promise)) return@launch
+            try {
+                musicService.setStopAt(positionSec)
+                promise.resolve(null)
+            } catch (exception: Exception) {
+                promise.reject("runtime_exception", exception.message, exception)
+            }
+        }
+    }
+
+    override fun clearStopAt(promise: Promise) {
+        Timber.d("🎵 TurboModule clearStopAt() called")
+        scope.launch {
+            if (verifyServiceBoundOrReject(promise)) return@launch
+            try {
+                musicService.clearStopAt()
                 promise.resolve(null)
             } catch (exception: Exception) {
                 promise.reject("runtime_exception", exception.message, exception)
@@ -1182,10 +1264,10 @@ class TrackPlayerModule(
         scope.launch {
             fun getStyle(check: Int): Int {
                 return when (check) {
-                    2 -> MediaConstants.DESCRIPTION_EXTRAS_VALUE_CONTENT_STYLE_GRID_ITEM
-                    3 -> MediaConstants.DESCRIPTION_EXTRAS_VALUE_CONTENT_STYLE_CATEGORY_LIST_ITEM
-                    4 -> MediaConstants.DESCRIPTION_EXTRAS_VALUE_CONTENT_STYLE_CATEGORY_GRID_ITEM
-                    else -> MediaConstants.DESCRIPTION_EXTRAS_VALUE_CONTENT_STYLE_LIST_ITEM
+                    2 -> MediaConstants.EXTRAS_VALUE_CONTENT_STYLE_GRID_ITEM
+                    3 -> MediaConstants.EXTRAS_VALUE_CONTENT_STYLE_CATEGORY_LIST_ITEM
+                    4 -> MediaConstants.EXTRAS_VALUE_CONTENT_STYLE_CATEGORY_GRID_ITEM
+                    else -> MediaConstants.EXTRAS_VALUE_CONTENT_STYLE_LIST_ITEM
                 }
             }
             if (verifyServiceBoundOrReject(promise)) return@launch
@@ -1211,7 +1293,19 @@ class TrackPlayerModule(
     // We then call the Codegen-generated emit methods to send events to JavaScript
     
     override fun onPlaybackState(state: String, data: Bundle) {
-        Timber.d("🎵 TrackPlayerModule.onPlaybackState: $state")
+        // The whole payload, not just the legacy string: `transport` is what the JS button binds to
+        // as of step 3, and "did the button ever leave pause during this load" is a question you
+        // answer from this line.
+        Timber.d(
+            "🎵 TrackPlayerModule.onPlaybackState: state=%s transport=%s readiness=%s reason=%s playWhenReady=%s isPlaying=%s suppression=%s",
+            state,
+            data.getString("transport"),
+            data.getString("readiness"),
+            data.getString("reason"),
+            data.getBoolean("playWhenReady"),
+            data.getBoolean("isPlaying"),
+            data.getString("suppression"),
+        )
         emit {
             val stateObj = Arguments.createMap().apply {
                 putString("state", state)
@@ -1221,13 +1315,25 @@ class TrackPlayerModule(
                         putMap("error", Arguments.fromBundle(errorBundle))
                     }
                 }
+                // Additive PlayerCore fields — the legacy `state` string above is unchanged, these
+                // ride alongside it (see MusicService.getPlayerStateBundle).
+                if (data.containsKey("playWhenReady")) putBoolean("playWhenReady", data.getBoolean("playWhenReady"))
+                if (data.containsKey("isPlaying")) putBoolean("isPlaying", data.getBoolean("isPlaying"))
+                data.getString("transport")?.let { putString("transport", it) }
+                data.getString("readiness")?.let { putString("readiness", it) }
+                data.getString("reason")?.let { putString("reason", it) }
+                data.getString("suppression")?.let { putString("suppression", it) }
             }
             emitOnPlaybackState(stateObj)
         }
     }
     
     override fun onPlaybackProgressUpdated(data: Bundle) {
-        Timber.d("🎵 TrackPlayerModule.onPlaybackProgressUpdated")
+        Timber.d(
+            "🎵 TrackPlayerModule.onPlaybackProgressUpdated: position=%s duration=%s",
+            data.getDouble("position"),
+            data.getDouble("duration"),
+        )
         emit {
             emitOnPlaybackProgressUpdated(Arguments.fromBundle(data))
         }
@@ -1258,6 +1364,13 @@ class TrackPlayerModule(
         Timber.d("🎵 TrackPlayerModule.onPlaybackPlayWhenReadyChanged")
         emit {
             emitOnPlaybackPlayWhenReadyChanged(Arguments.fromBundle(data))
+        }
+    }
+
+    override fun onPlaybackStopAtReached(data: Bundle) {
+        Timber.d("🎵 TrackPlayerModule.onPlaybackStopAtReached")
+        emit {
+            emitOnPlaybackStopAtReached(Arguments.fromBundle(data))
         }
     }
     
@@ -1402,18 +1515,20 @@ class TrackPlayerModule(
      * @param errorMessage User-readable error message
      */
     override fun setPlaybackStateError(errorCode: Double, errorMessage: String, promise: Promise) {
-        if (!verifyServiceBoundOrReject(promise)) return
-        
-        try {
-            val player = musicService.getPlayer()
-            if (player != null) {
-                player.setPlaybackStateError(errorCode.toInt(), errorMessage)
+        // The guard was inverted (`if (!verifyServiceBoundOrReject(promise)) return`), and
+        // `verifyServiceBoundOrReject` returns true when it *rejected*: with the service bound —
+        // the only case in which this can do anything — the method returned immediately, without
+        // setting the error and without settling the promise, so the `await` in JS never came back.
+        // Found while checking §4's "setPlaybackStateError producing a legacy STATE_ERROR with a
+        // code"; it had never produced one.
+        scope.launch {
+            if (verifyServiceBoundOrReject(promise)) return@launch
+            try {
+                musicService.setPlaybackStateError(errorCode.toInt(), errorMessage)
                 promise.resolve(null)
-            } else {
-                promise.reject("player_not_initialized", "Player not initialized")
+            } catch (e: Exception) {
+                promise.reject("error_setting_playback_state_error", e.message ?: "Unknown error", e)
             }
-        } catch (e: Exception) {
-            promise.reject("error_setting_playback_state_error", e.message ?: "Unknown error", e)
         }
     }
     

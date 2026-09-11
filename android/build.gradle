@@ -16,6 +16,10 @@ apply plugin: 'com.android.library'
 apply plugin: 'com.facebook.react'
 apply plugin: 'org.jetbrains.kotlin.android'
 
+// AndroidX Media3. 1.11.0 is the latest on Google Maven as of 2026-09-10 and needs nothing the
+// app's toolchain (AGP from RN 0.86, Gradle 9.3.1, Kotlin 2.1.20, compileSdk 36) does not have.
+def media3Version = safeExtGet('media3Version', '1.11.0')
+
 def getExtOrIntegerDefault(name) {
     return rootProject.ext.has(name) ? rootProject.ext.get(name) : (project.properties['RNTP_' + name]).toInteger()
 }
@@ -23,26 +27,72 @@ def getExtOrIntegerDefault(name) {
 android {
     compileSdkVersion safeExtGet('compileSdkVersion', 33)
     namespace "com.doublesymmetry.trackplayer"
+
+    defaultConfig {
+        // Unset before, this module's minSdk silently floated at 1 (only the androidTest APK's
+        // own manifest merge ever noticed — the main manifest already declares minSdkVersion 23,
+        // and the app that autolinks this module declares 24, so this is not a behavior change).
+        // Needed for connectedAndroidTest: androidx.test:rules 1.6.1 requires minSdk 19, and the
+        // manifest merger enforces that against whatever this module claims, not the app's.
+        minSdkVersion safeExtGet('minSdkVersion', 23)
+        testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
+    }
+
+    // Most of media3's ExoPlayer, DataSource and Extractor surface is annotated @UnstableApi
+    // (androidx.annotation.RequiresOptIn). An engine is by definition made of it, so the opt-in is
+    // module-wide rather than an annotation on every file.
+    kotlinOptions {
+        freeCompilerArgs += ["-opt-in=androidx.media3.common.util.UnstableApi"]
+    }
 }
 
 repositories {
     mavenCentral()
     google()
-    maven { url 'https://jitpack.io' }
 }
 
 dependencies {
     implementation 'com.facebook.react:react-native'
-    
-    // KotlinAudio from JitPack (losikov fork)
-    // Commit c98a0dd: CbrMp3Extractor — exact seeking for constant-bitrate MP3s
-    // Use full SHA — JitPack returns tagNotFound for a short hash
-    // Previous: cb5f9d4 (jumpToItem positionMs), 2c6300b (Android Auto audio routing)
-    implementation 'com.github.losikov:KotlinAudio:c98a0dd28492489b3ad52bf431312e79e2f096ab'
-    
+
+    // KotlinAudio (com.doublesymmetry.kotlinaudio) is vendored in src/main/java — see
+    // src/main/java/com/doublesymmetry/kotlinaudio/NOTICE.md. This used to be
+    // 'com.github.losikov:KotlinAudio:c98a0dd28492489b3ad52bf431312e79e2f096ab' from JitPack.
+    //
+    // AndroidX Media3 replaces com.google.android.exoplayer:exoplayer:2.19.1 and its
+    // extension-mediasession. media3-datasource, media3-database and media3-extractor arrive
+    // transitively through media3-exoplayer; media3-ui is deliberately NOT here (the notification
+    // comes from media3-session's DefaultMediaNotificationProvider, and nothing draws a player
+    // view). The dash/hls/smoothstreaming artifacts are only needed because the JS `TrackType` enum
+    // still offers those types.
+    //
+    // coil is gone with the 903-line NotificationManager it existed for: media3's default
+    // DataSourceBitmapLoader loads content://, file:// and http(s):// artwork.
+    api "androidx.media3:media3-exoplayer:$media3Version"
+    api "androidx.media3:media3-session:$media3Version"
+    api "androidx.media3:media3-common:$media3Version"
+    implementation "androidx.media3:media3-exoplayer-hls:$media3Version"
+    implementation "androidx.media3:media3-exoplayer-dash:$media3Version"
+    implementation "androidx.media3:media3-exoplayer-smoothstreaming:$media3Version"
+    api 'com.jakewharton.timber:timber:5.0.1'
+
     implementation "androidx.core:core-ktx:1.9.0"
     implementation "androidx.localbroadcastmanager:localbroadcastmanager:1.1.0"
     implementation "androidx.lifecycle:lifecycle-process:2.5.1"
     implementation "org.jetbrains.kotlinx:kotlinx-coroutines-core:1.6.3"
-    implementation 'androidx.media:media:1.6.0'
+    // Only for android.support.v4.media.RatingCompat, which Track/TrackMetadata/BundleUtils use to
+    // carry the JS `rating` field. media3 vendors its own copy of the legacy classes under
+    // androidx.media3.session.legacy and does not export RatingCompat.
+    implementation 'androidx.media:media:1.7.0'
+
+    // Instrumented tests vendored from KotlinAudio, converted from JUnit 5 to JUnit 4 (the
+    // de.mannodermaus android-junit5 plugin is not added here — this module is a library inside
+    // the app's Gradle build, not a standalone project with its own plugin classpath).
+    androidTestImplementation 'androidx.test:runner:1.6.2'
+    androidTestImplementation 'androidx.test:rules:1.6.1'
+    androidTestImplementation 'androidx.test.ext:junit:1.2.1'
+    androidTestImplementation 'junit:junit:4.13.2'
+    androidTestImplementation('org.awaitility:awaitility:4.2.0') { transitive = false }
+    androidTestImplementation('org.awaitility:awaitility-kotlin:4.2.0') { transitive = false }
+    androidTestImplementation "androidx.media3:media3-exoplayer:$media3Version"
+    androidTestImplementation "androidx.media3:media3-session:$media3Version"
 }

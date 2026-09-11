@@ -30,6 +30,12 @@ export type {
   PlaybackQueueEndedEvent,
   PlaybackErrorEvent,
   PlaybackActiveTrackChangedEvent,
+  // The engine state model ("PlayerCore"): what the play/pause button binds to.
+  PlaybackStateSnapshot,
+  PlaybackTransport,
+  PlaybackReadiness,
+  PlaybackTransportReason,
+  PlaybackSuppression,
   // Export Spec type so consumers can use it for type assertions if needed
   Spec,
 } from '../js/NativeRTNTrackPlayer';

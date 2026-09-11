@@ -1,15 +1,15 @@
 package com.doublesymmetry.trackplayer.model
 
 import android.os.Bundle
-import com.google.android.exoplayer2.MediaMetadata
-import com.google.android.exoplayer2.metadata.Metadata
-import com.google.android.exoplayer2.metadata.flac.VorbisComment
-import com.google.android.exoplayer2.metadata.icy.IcyHeaders
-import com.google.android.exoplayer2.metadata.icy.IcyInfo
-import com.google.android.exoplayer2.metadata.id3.ChapterFrame
-import com.google.android.exoplayer2.metadata.id3.TextInformationFrame
-import com.google.android.exoplayer2.metadata.id3.UrlLinkFrame
-import com.google.android.exoplayer2.metadata.mp4.MdtaMetadataEntry
+import androidx.media3.common.MediaMetadata
+import androidx.media3.common.Metadata
+import androidx.media3.extractor.metadata.vorbis.VorbisComment
+import androidx.media3.extractor.metadata.icy.IcyHeaders
+import androidx.media3.extractor.metadata.icy.IcyInfo
+import androidx.media3.extractor.metadata.id3.ChapterFrame
+import androidx.media3.extractor.metadata.id3.TextInformationFrame
+import androidx.media3.extractor.metadata.id3.UrlLinkFrame
+import androidx.media3.container.MdtaMetadataEntry
 import timber.log.Timber
 
 sealed class MetadataAdapter {
