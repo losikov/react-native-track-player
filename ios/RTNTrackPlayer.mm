@@ -2,11 +2,38 @@
 #import <RTNTrackPlayerSpec/RTNTrackPlayerSpec.h>
 #import "react_native_track_player/react_native_track_player-Swift.h"
 
+#include <mutex>
+
 // We need to actually inherit from the base class to get the emitOnXXX methods
 @interface RTNTrackPlayer : NativeRTNTrackPlayerSpecBase <NativeRTNTrackPlayerSpec, RTNTrackPlayerEventEmitter>
+- (void)detachEventEmitterCallback;
 @end
 
+namespace {
+
+// The codegen'd JSI class hands this module an event emitter callback that captures the JSI object
+// by reference (`eventEmitterMap_[name]`), and nothing clears it when that object is destroyed.
+// `TrackPlayer` listens to `PlayerCore.shared`, which outlives a JS reload, so the old module can
+// still emit after its JSI object is freed: SIGABRT in `std::__next_prime` on
+// com.swiftAudioEx.eventQueue. Detach the callback while the object's map still exists.
+class RTNTrackPlayerTurboModule final : public facebook::react::NativeRTNTrackPlayerSpecJSI {
+ public:
+  explicit RTNTrackPlayerTurboModule(const facebook::react::ObjCTurboModule::InitParams &params)
+      : NativeRTNTrackPlayerSpecJSI(params) {}
+
+  ~RTNTrackPlayerTurboModule() override
+  {
+    // `instance_` is still retained here; the base class releases it after this body.
+    [(RTNTrackPlayer *)instance_ detachEventEmitterCallback];
+  }
+};
+
+} // namespace
+
 @implementation RTNTrackPlayer {
+    // `_eventEmitterCallback` is set and cleared on the JS thread and called from the player's
+    // threads. Every emit holds this lock, so the callback cannot be cleared in the middle of one.
+    std::mutex _eventEmitterMutex;
     TrackPlayer *_trackPlayer;
 }
 
@@ -176,72 +203,97 @@ RCT_EXPORT_MODULE()
 - (std::shared_ptr<facebook::react::TurboModule>)getTurboModule:
     (const facebook::react::ObjCTurboModule::InitParams &)params
 {
-    return std::make_shared<facebook::react::NativeRTNTrackPlayerSpecJSI>(params);
+    return std::make_shared<RTNTrackPlayerTurboModule>(params);
+}
+
+// MARK: - Event emitter callback lifetime
+
+- (void)setEventEmitterCallback:(EventEmitterCallbackWrapper *)eventEmitterCallbackWrapper
+{
+    std::lock_guard<std::mutex> lock(_eventEmitterMutex);
+    [super setEventEmitterCallback:eventEmitterCallbackWrapper];
+}
+
+- (void)detachEventEmitterCallback
+{
+    std::lock_guard<std::mutex> lock(_eventEmitterMutex);
+    _eventEmitterCallback = nullptr;
+}
+
+// Emits only while a live JSI object owns the callback: not before `getTurboModule:` installs it
+// (`TrackPlayer` is already subscribed to the shared player by then, and an empty callback throws),
+// and not after that object is destroyed.
+- (void)emitIfAttached:(NS_NOESCAPE dispatch_block_t)emit
+{
+    std::lock_guard<std::mutex> lock(_eventEmitterMutex);
+    if (_eventEmitterCallback) {
+        emit();
+    }
 }
 
 // MARK: - RTNTrackPlayerEventEmitter Methods
 - (void)emitPlaybackState:(NSDictionary *)state {
-    [self emitOnPlaybackState:state];
+    [self emitIfAttached:^{ [self emitOnPlaybackState:state]; }];
 }
 
 - (void)emitPlaybackProgressUpdated:(NSDictionary *)progress {
-    [self emitOnPlaybackProgressUpdated:progress];
+    [self emitIfAttached:^{ [self emitOnPlaybackProgressUpdated:progress]; }];
 }
 
 - (void)emitPlaybackQueueEnded:(NSDictionary *)event {
-    [self emitOnPlaybackQueueEnded:event];
+    [self emitIfAttached:^{ [self emitOnPlaybackQueueEnded:event]; }];
 }
 
 - (void)emitPlaybackError:(NSDictionary *)error {
-    [self emitOnPlaybackError:error];
+    [self emitIfAttached:^{ [self emitOnPlaybackError:error]; }];
 }
 
 - (void)emitPlaybackActiveTrackChanged:(NSDictionary *)event {
-    [self emitOnPlaybackActiveTrackChanged:event];
+    [self emitIfAttached:^{ [self emitOnPlaybackActiveTrackChanged:event]; }];
 }
 
 - (void)emitPlaybackPlayWhenReadyChanged:(NSDictionary *)event {
-    [self emitOnPlaybackPlayWhenReadyChanged:event];
+    [self emitIfAttached:^{ [self emitOnPlaybackPlayWhenReadyChanged:event]; }];
 }
 
 - (void)emitPlaybackStopAtReached:(NSDictionary *)event {
-    [self emitOnPlaybackStopAtReached:event];
+    [self emitIfAttached:^{ [self emitOnPlaybackStopAtReached:event]; }];
 }
 
 - (void)emitRemotePlay {
-    [self emitOnRemotePlay];
+    [self emitIfAttached:^{ [self emitOnRemotePlay]; }];
 }
 
 - (void)emitRemotePause {
-    [self emitOnRemotePause];
+    [self emitIfAttached:^{ [self emitOnRemotePause]; }];
 }
 
 - (void)emitRemoteStop {
-    [self emitOnRemoteStop];
+    [self emitIfAttached:^{ [self emitOnRemoteStop]; }];
 }
 
 - (void)emitRemoteNext {
-    [self emitOnRemoteNext];
+    [self emitIfAttached:^{ [self emitOnRemoteNext]; }];
 }
 
 - (void)emitRemotePrevious {
-    [self emitOnRemotePrevious];
+    [self emitIfAttached:^{ [self emitOnRemotePrevious]; }];
 }
 
 - (void)emitRemoteSeek:(NSDictionary *)event {
-    [self emitOnRemoteSeek:event];
+    [self emitIfAttached:^{ [self emitOnRemoteSeek:event]; }];
 }
 
 - (void)emitRemoteJumpForward:(NSDictionary *)event {
-    [self emitOnRemoteJumpForward:event];
+    [self emitIfAttached:^{ [self emitOnRemoteJumpForward:event]; }];
 }
 
 - (void)emitRemoteJumpBackward:(NSDictionary *)event {
-    [self emitOnRemoteJumpBackward:event];
+    [self emitIfAttached:^{ [self emitOnRemoteJumpBackward:event]; }];
 }
 
 - (void)emitRemoteBookmark {
-    [self emitOnRemoteBookmark];
+    [self emitIfAttached:^{ [self emitOnRemoteBookmark]; }];
 }
 
 // MARK: - Setup and configuration
@@ -452,7 +504,7 @@ RCT_EXPORT_MODULE()
 
 // MARK: - Event Emitters
 - (void)emitRemoteDuck:(NSDictionary *)event {
-    [self emitOnRemoteDuck:event];
+    [self emitIfAttached:^{ [self emitOnRemoteDuck:event]; }];
 }
 
 @end
