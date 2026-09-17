@@ -208,9 +208,10 @@ public final class PlayerCore: NSObject {
         }
         player.event.seek.addListener(self) { [weak self] data in
             guard let self = self else { return }
-            // A seek that a newer one replaced completes unfinished after the newer one armed its
-            // own target. Unmasking then would report the old clock until the newer seek lands.
-            if !data.didFinish, let pending = self.pendingPosition, abs(pending - data.seconds) > 0.05 {
+            // Every seek issued here reports exactly the target it asked for, so a completion for any
+            // other value is a seek a newer one replaced, finished or not. Unmasking on it would
+            // report the old clock until the newer seek lands.
+            if let pending = self.pendingPosition, abs(pending - data.seconds) > 0.001 {
                 return
             }
             // The seek has landed. Report it once: no interval tick will, because a seek while
@@ -349,6 +350,7 @@ public final class PlayerCore: NSObject {
 
     public func stop(reason: PlaybackTransportReason = .user) {
         clearStopAt()
+        pendingPosition = nil
         player.stop()
         publishSnapshot(reason: reason)
     }
@@ -367,12 +369,12 @@ public final class PlayerCore: NSObject {
 
     public func seek(by offset: Double, reason: PlaybackTransportReason = .user) {
         clearStopAt()
-        let current = player.currentTime
-        // While the item loads, `AVPlayerWrapper.seek(by:)` adds the offset to the deferred target,
-        // not to the clock, which reads 0 until the asset is ready.
-        let base = player.playerState == .loading ? pendingPosition : nil
-        pendingPosition = max(0, (base ?? (current.isFinite ? current : 0)) + offset)
-        player.seek(by: offset)
+        // An absolute seek from the position already reported, so the mask and the seek always agree
+        // and quick jumps add up the way ExoPlayer's masked `seekBy` does. `AVPlayerWrapper.seek(by:)`
+        // reads the item's own clock instead, which is 0 while a replaced item is still loading.
+        let target = max(0, position + offset)
+        pendingPosition = target
+        player.seek(to: target)
         publishSnapshot(reason: reason)
     }
 
