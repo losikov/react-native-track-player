@@ -86,6 +86,15 @@ interface MusicServiceEventListener {
 }
 
 /**
+ * Native code in the app that follows playback without a React hop. Called on Main whenever the
+ * engine's state, current item or play intent changes, or its position jumps; read the rest from
+ * [MusicService.getInstance].
+ */
+fun interface PlaybackObserver {
+    fun onPlaybackChanged()
+}
+
+/**
  * The media3 `MediaLibraryService`.
  *
  * Compared with the `MediaBrowserServiceCompat` it replaces, three whole subsystems are gone:
@@ -432,6 +441,7 @@ class MusicService : HeadlessJsMediaService() {
         pendingSearchRequests.clear()
 
         setInstance(null)
+        notifyPlaybackObservers()
         super.onDestroy()
     }
 
@@ -1234,6 +1244,11 @@ class MusicService : HeadlessJsMediaService() {
     @MainThread
     fun getPositionInSeconds(): Double = player.position.toSeconds()
 
+    /** The `id` the app gave the current queue item, or null when there is no engine or no queue. */
+    @MainThread
+    fun getActiveTrackId(): String? =
+        (engine?.currentItem as? TrackAudioItem)?.track?.originalItem?.getString("id")
+
     @MainThread
     fun getBufferedPositionInSeconds(): Double = player.bufferedPosition.toSeconds()
 
@@ -1320,6 +1335,7 @@ class MusicService : HeadlessJsMediaService() {
                 val stateBundle = getPlayerStateBundle(it)
                 val state = stateBundle.getString("state") ?: ""
                 trackPlayerModule?.onPlaybackState(state, stateBundle)
+                notifyPlaybackObservers()
 
                 if (it == AudioPlayerState.ENDED && engine?.nextItem == null) {
                     emitQueueEndedEvent()
@@ -1329,6 +1345,7 @@ class MusicService : HeadlessJsMediaService() {
 
         eventJobs += scope.launch {
             event.audioItemTransition.collect {
+                notifyPlaybackObservers()
                 if (it !is AudioItemTransitionReason.REPEAT) {
                     emitPlaybackTrackChangedEvents(
                         engine?.currentIndex,
@@ -1351,6 +1368,7 @@ class MusicService : HeadlessJsMediaService() {
             // holding the pre-seek position.
             event.progressDiscontinuity.collect {
                 trackPlayerModule?.onPlaybackProgressUpdated(progressUpdateEvent())
+                notifyPlaybackObservers()
             }
         }
 
@@ -1371,6 +1389,7 @@ class MusicService : HeadlessJsMediaService() {
                 trackPlayerModule?.onPlaybackPlayWhenReadyChanged(Bundle().apply {
                     putBoolean("playWhenReady", it.playWhenReady)
                 })
+                notifyPlaybackObservers()
             }
         }
 
@@ -1389,6 +1408,10 @@ class MusicService : HeadlessJsMediaService() {
                 trackPlayerModule?.onPlaybackError(errorMessage, errorBundle)
             }
         }
+    }
+
+    private fun notifyPlaybackObservers() {
+        playbackObservers.forEach { it.onPlaybackChanged() }
     }
 
     private fun emitPlaybackTrackChangedEvents(index: Int?, previousIndex: Int?, oldPosition: Double) {
@@ -1492,6 +1515,19 @@ class MusicService : HeadlessJsMediaService() {
 
         fun setInstance(service: MusicService?) {
             instance = service
+        }
+
+        // Static so an observer registered before the service exists, or across a service restart, keeps hearing.
+        private val playbackObservers = java.util.concurrent.CopyOnWriteArraySet<PlaybackObserver>()
+
+        @MainThread
+        fun addPlaybackObserver(observer: PlaybackObserver) {
+            playbackObservers.add(observer)
+        }
+
+        @MainThread
+        fun removePlaybackObserver(observer: PlaybackObserver) {
+            playbackObservers.remove(observer)
         }
 
         /**

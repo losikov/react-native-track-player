@@ -145,16 +145,18 @@ public struct PlayerSnapshot: Equatable {
 // MARK: - The engine
 
 public final class PlayerCore: NSObject {
-    public static let shared = PlayerCore()
+    // The `@objc` members are what app code reaches from Objective-C: a Swift `import` of this module
+    // from an app target can hide React's own types from the app's other Swift files.
+    @objc public static let shared = PlayerCore()
 
     /// Posted whenever ``snapshot`` changes. `userInfo["snapshot"]` is ``PlayerSnapshot/asDictionary()``
     /// so ObjC and UIKit code can subscribe without Combine; Swift callers can read ``snapshot``
     /// or subscribe to `$snapshot`.
-    public static let snapshotDidChange = Notification.Name("PlayerCore.snapshotDidChange")
+    @objc public static let snapshotDidChange = Notification.Name("PlayerCore.snapshotDidChange")
     /// Posted on a position jump no interval tick will report — a seek (including a seek while
     /// paused) and ``loadQueue(items:startIndex:startPosition:playWhenReady:)``.
     /// `userInfo` carries `position`, `duration`, `buffered`.
-    public static let progressDidJump = Notification.Name("PlayerCore.progressDidJump")
+    @objc public static let progressDidJump = Notification.Name("PlayerCore.progressDidJump")
     /// Posted when playback reached the position armed by ``setStopAt(_:)``. `userInfo["position"]`.
     public static let stopAtReached = Notification.Name("PlayerCore.stopAtReached")
 
@@ -188,6 +190,11 @@ public final class PlayerCore: NSObject {
     private var stopAtTarget: Double?
     private var stopAtTimer: Timer?
 
+    /// See ``commandGeneration``. Commands run on the module queue and on main; readers on either.
+    private let commandLock = NSLock()
+    private var commandGenerationValue = 0
+    private var commandsInFlight = 0
+
     override private init() {
         super.init()
         player.playWhenReady = false
@@ -201,6 +208,11 @@ public final class PlayerCore: NSObject {
         }
         player.event.seek.addListener(self) { [weak self] data in
             guard let self = self else { return }
+            // A seek that a newer one replaced completes unfinished after the newer one armed its
+            // own target. Unmasking then would report the old clock until the newer seek lands.
+            if !data.didFinish, let pending = self.pendingPosition, abs(pending - data.seconds) > 0.05 {
+                return
+            }
             // The seek has landed. Report it once: no interval tick will, because a seek while
             // paused produces none, and the tick after a seek while playing is up to a second late.
             self.pendingPosition = nil
@@ -215,7 +227,7 @@ public final class PlayerCore: NSObject {
     /// The position to report to anyone outside the engine: the position a load or a seek asked
     /// for while that is still in flight, the player's own clock otherwise. This is what makes
     /// `getPosition()` / `getProgress()` answer the same way ExoPlayer's masked position does.
-    public var position: Double {
+    @objc public var position: Double {
         if let pending = pendingPosition { return pending }
         let current = player.currentTime
         return current.isFinite ? current : 0
@@ -231,6 +243,53 @@ public final class PlayerCore: NSObject {
         return value.isFinite ? value : 0
     }
 
+    /// The `id` the app gave the current queue item, or nil when nothing is queued. `Track` is internal,
+    /// so native app code has no other way to tell which track ``position`` belongs to.
+    @objc public var activeTrackId: String? {
+        (player.currentItem as? Track)?.toObject()["id"] as? String
+    }
+
+    /// Whether the recording is moving: playing, or buffering on the way to playing. A seek while
+    /// paused buffers too, and is not. Read live, unlike ``snapshot``, which is published from several
+    /// queues and can arrive out of order.
+    @objc public var isRunning: Bool {
+        switch player.playerState {
+        case .playing: return true
+        case .buffering: return player.playWhenReady
+        default: return false
+        }
+    }
+
+    /// Whether the queue has played out.
+    @objc public var hasEnded: Bool {
+        player.playerState == .ended
+    }
+
+    /// Moves whenever a load or a skip starts or finishes, and reads -1 while one is running.
+    ///
+    /// Those commands pass through states no reader may pair up: a load makes the queue's *first*
+    /// item current before it jumps to the requested one. A reader on another thread samples this
+    /// around its reads and drops the sample unless it read the same non-negative value both times.
+    @objc public var commandGeneration: Int {
+        commandLock.lock()
+        defer { commandLock.unlock() }
+        return commandsInFlight > 0 ? -1 : commandGenerationValue
+    }
+
+    private func beginCommand() {
+        commandLock.lock()
+        commandsInFlight += 1
+        commandGenerationValue += 1
+        commandLock.unlock()
+    }
+
+    private func endCommand() {
+        commandLock.lock()
+        commandsInFlight -= 1
+        commandGenerationValue += 1
+        commandLock.unlock()
+    }
+
     /// Whether a ``setStopAt(_:)`` is currently armed.
     public var stopAtPosition: Double? { stopAtTarget }
 
@@ -244,6 +303,8 @@ public final class PlayerCore: NSObject {
     /// applies it the moment the asset is ready — and ``position`` reports the target in the
     /// meantime, so no event can carry a 0 before it.
     public func loadQueue(items: [AudioItem], startIndex: Int, startPosition: Double, playWhenReady: Bool) throws {
+        beginCommand()
+        defer { endCommand() }
         clearStopAt()
         pendingPosition = nil
         player.playWhenReady = false
@@ -307,12 +368,17 @@ public final class PlayerCore: NSObject {
     public func seek(by offset: Double, reason: PlaybackTransportReason = .user) {
         clearStopAt()
         let current = player.currentTime
-        pendingPosition = max(0, (current.isFinite ? current : 0) + offset)
+        // While the item loads, `AVPlayerWrapper.seek(by:)` adds the offset to the deferred target,
+        // not to the clock, which reads 0 until the asset is ready.
+        let base = player.playerState == .loading ? pendingPosition : nil
+        pendingPosition = max(0, (base ?? (current.isFinite ? current : 0)) + offset)
         player.seek(by: offset)
         publishSnapshot(reason: reason)
     }
 
     public func skip(to index: Int, position: Double? = nil) throws {
+        beginCommand()
+        defer { endCommand() }
         clearStopAt()
         // Armed before the jump, and only when a seek will actually follow: `jumpToItem` answers
         // "already on this index" with `seek(to: 0)`, and the position below is the one that must
