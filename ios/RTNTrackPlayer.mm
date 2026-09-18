@@ -200,6 +200,15 @@ RCT_EXPORT_MODULE()
     return config;
 }
 
+// RCTInvalidating: the TurboModule manager calls this on the module's method queue when the React
+// instance is torn down (a JS reload). Stop emitting first, then detach from `PlayerCore.shared`
+// rather than resetting it: the engine outlives this instance and the next one's module takes over.
+- (void)invalidate
+{
+    [self detachEventEmitterCallback];
+    [_trackPlayer detach];
+}
+
 - (std::shared_ptr<facebook::react::TurboModule>)getTurboModule:
     (const facebook::react::ObjCTurboModule::InitParams &)params
 {

@@ -41,7 +41,12 @@ public class TrackPlayer: NSObject, AudioSessionControllerDelegate {
     public override init() {
         super.init()
         audioSessionController.delegate = self
-        player.playWhenReady = false;
+        // No `player.playWhenReady = false` here: `PlayerCore` sets that once, when the engine is
+        // created. A module is created per React instance, so here it paused playback on every reload.
+        //
+        // These listeners are bound methods, and SwiftAudioEx's `Event` keeps the closure strongly
+        // (only its `listener` reference is weak). The engine therefore keeps this object alive, and
+        // handling every event, until `detach()` removes them.
         player.event.receiveChapterMetadata.addListener(self, handleAudioPlayerChapterMetadataReceived)
         player.event.receiveTimedMetadata.addListener(self, handleAudioPlayerTimedMetadataReceived)
         player.event.receiveCommonMetadata.addListener(self, handleAudioPlayerCommonMetadataReceived)
@@ -90,10 +95,30 @@ public class TrackPlayer: NSObject, AudioSessionControllerDelegate {
         self.eventEmitter = eventEmitter
     }
 
+    /// The React instance this module belongs to is going away — a JS reload. Remove this module's
+    /// listeners from the shared engine and leave the engine exactly as it is: it keeps playing, and
+    /// the next instance's module subscribes on its own. Removal is queued on each event's queue, so
+    /// an event already queued can still reach the old handlers once; their emits are cut off by
+    /// then. This is the iOS half of `TrackPlayerModule.invalidate()` on Android.
+    @objc
+    public func detach() {
+        player.event.receiveChapterMetadata.removeListener(self)
+        player.event.receiveTimedMetadata.removeListener(self)
+        player.event.receiveCommonMetadata.removeListener(self)
+        player.event.stateChange.removeListener(self)
+        player.event.fail.removeListener(self)
+        player.event.currentItem.removeListener(self)
+        player.event.secondElapse.removeListener(self)
+        player.event.playWhenReadyChange.removeListener(self)
+        observerTokens.forEach { NotificationCenter.default.removeObserver($0) }
+        observerTokens.removeAll()
+    }
+
+    // No `reset` here. The engine is shared and outlives this module, and by the time this runs the
+    // next React instance may already have loaded its own queue into it.
     deinit {
         observerTokens.forEach { NotificationCenter.default.removeObserver($0) }
         observerTokens.removeAll()
-        reset(resolve: { _ in }, reject: { _, _, _  in })
     }
 
     // MARK: - RCTEventEmitter
@@ -337,6 +362,14 @@ public class TrackPlayer: NSObject, AudioSessionControllerDelegate {
             self?.eventEmitter?.emitRemoteBookmark()
             return MPRemoteCommandHandlerStatus.success
         }
+
+        // MPRemoteCommandCenter keeps a copy of each handler from the last registration, so the
+        // assignments above take effect only when the commands are registered again. After a JS
+        // reload the engine can still hold an item whose commands call the previous module's
+        // handlers, which do nothing once that module is gone: register again now. With no current
+        // item this is a no-op, and loading one registers them.
+        let remoteCommands = player.remoteCommands
+        player.remoteCommands = remoteCommands
 
         hasInitialized = true
         resolve(NSNull())
