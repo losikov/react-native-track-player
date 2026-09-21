@@ -69,6 +69,10 @@ class TrackPlayerModule(
     private var invalidated = false
     private val emitLock = Any()
 
+    /** Registered by [setupPlayer], unregistered by [invalidate]. */
+    @Volatile
+    private var musicEventsReceiver: BroadcastReceiver? = null
+
     /**
      * Every JS-bound event goes through here. `MusicService` is a started service that outlives the
      * React instance: after a reload it kept calling the *old* module, whose codegen emitter is a
@@ -92,9 +96,15 @@ class TrackPlayerModule(
      */
     override fun invalidate() {
         synchronized(emitLock) { invalidated = true }
-        if (::musicService.isInitialized && musicService.trackPlayerModule === this) {
-            musicService.trackPlayerModule = null
+        // On Main, where the service reads the seat and where the next instance's module takes it
+        // in `onServiceConnected`: done from this thread, the check-then-clear could land after the
+        // new module sat down and unseat it.
+        UiThreadUtil.runOnUiThread {
+            if (::musicService.isInitialized) musicService.detachModule(this)
         }
+        // It holds this instance's ReactContext and would emit into it on any broadcast.
+        musicEventsReceiver?.let { LocalBroadcastManager.getInstance(context).unregisterReceiver(it) }
+        musicEventsReceiver = null
         if (isServiceBound) {
             isServiceBound = false
             try {
@@ -280,10 +290,11 @@ class TrackPlayerModule(
             playerSetUpPromise = promise
             playerOptions = bundledData
 
-            LocalBroadcastManager.getInstance(context).registerReceiver(
-                com.doublesymmetry.trackplayer.module.MusicEvents(context),
-                IntentFilter(EVENT_INTENT)
-            )
+            if (musicEventsReceiver == null) {
+                musicEventsReceiver = com.doublesymmetry.trackplayer.module.MusicEvents(context).also {
+                    LocalBroadcastManager.getInstance(context).registerReceiver(it, IntentFilter(EVENT_INTENT))
+                }
+            }
 
             // Service binding was already done above (before foreground check)
             // If we're here, app is in foreground, so we can continue with setupPlayer()

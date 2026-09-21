@@ -839,6 +839,28 @@ class MusicService : HeadlessJsMediaService() {
         }
     }
 
+    /**
+     * The React instance behind [module] is going away — a JS reload or a host destroy — while this
+     * service keeps playing. Give up its listener seat, unless the next instance's module already
+     * holds it, and hand the searches that instance never answered back to the queue: a browser
+     * that searched is waiting for `notifySearchResultChanged`, and the dead JS will not send it.
+     * The next module re-issues them from `onServiceConnected` through [processPendingSearchRequests].
+     * Browse requests need nothing: they wait on the tree, not on JS, and [sendPendingBrowseResults]
+     * runs again on the next bind.
+     */
+    @MainThread
+    fun detachModule(module: MusicServiceEventListener) {
+        if (trackPlayerModule !== module) return
+        trackPlayerModule = null
+        if (pendingSearchResults.isNotEmpty()) {
+            Timber.tag("RNTP-AA").d("Requeueing ${pendingSearchResults.size} unanswered search(es) after the module detached")
+            pendingSearchResults.values.forEach {
+                pendingSearchRequests.add(PendingSearchRequest(it.query, it.params?.extras, it.controller, it.params))
+            }
+            pendingSearchResults.clear()
+        }
+    }
+
     /** Process search requests queued before the TurboModule was ready. */
     fun processPendingSearchRequests() {
         if (pendingSearchRequests.isEmpty()) {
