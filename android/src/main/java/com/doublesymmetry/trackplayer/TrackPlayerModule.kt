@@ -1442,6 +1442,13 @@ class TrackPlayerModule(
         }
     }
     
+    override fun onRemoteSetRate(data: Bundle) {
+        Timber.d("🎵 TrackPlayerModule.onRemoteSetRate")
+        emit {
+            emitOnRemoteSetRate(Arguments.fromBundle(data))
+        }
+    }
+
     override fun onRemoteBookmark() {
         Timber.d("🎵 TrackPlayerModule.onRemoteBookmark")
         emit {

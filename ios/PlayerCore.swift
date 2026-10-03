@@ -159,9 +159,16 @@ public final class PlayerCore: NSObject {
     @objc public static let progressDidJump = Notification.Name("PlayerCore.progressDidJump")
     /// Posted when playback reached the position armed by ``setStopAt(_:)``. `userInfo["position"]`.
     public static let stopAtReached = Notification.Name("PlayerCore.stopAtReached")
+    /// Posted on main after a *remote* speed control changed the rate — never for ``setRate(_:)``,
+    /// which is what JS calls. `userInfo[rateKey]` is the rate applied (a `Double`, already snapped),
+    /// `userInfo[trackIdKey]` the ``activeTrackId`` it applies to, absent when nothing is queued.
+    /// App code persists the rate from here, which is why it is posted whether or not JS is alive.
+    @objc public static let remoteRateDidChange = Notification.Name("PlayerCore.remoteRateDidChange")
 
     public static let snapshotKey = "snapshot"
     public static let positionKey = "position"
+    @objc public static let rateKey = "rate"
+    @objc public static let trackIdKey = "trackId"
 
     /// The queue. `TrackPlayer.swift` still talks to it directly for everything the snapshot does
     /// not cover (metadata, remote commands, repeat mode); transport goes through the commands below
@@ -190,6 +197,11 @@ public final class PlayerCore: NSObject {
     private var stopAtTarget: Double?
     private var stopAtTimer: Timer?
 
+    /// The rates a remote speed control offers, in ascending order; empty while the app has not enabled
+    /// one. Set through ``configureRemotePlaybackRates(_:)``, read on main.
+    public private(set) var remotePlaybackRates: [Double] = []
+    private var changePlaybackRateTarget: Any?
+
     /// See ``commandGeneration``. Commands run on the module queue and on main; readers on either.
     private let commandLock = NSLock()
     private var commandGenerationValue = 0
@@ -200,7 +212,11 @@ public final class PlayerCore: NSObject {
         player.playWhenReady = false
         player.event.stateChange.addListener(self) { [weak self] _ in self?.publishSnapshot() }
         player.event.playWhenReadyChange.addListener(self) { [weak self] _ in self?.publishSnapshot() }
-        player.event.currentItem.addListener(self) { [weak self] _ in self?.publishSnapshot() }
+        player.event.currentItem.addListener(self) { [weak self] _ in
+            self?.publishSnapshot()
+            // `loadQueue` clears the Now Playing info, and a new item starts from the old keys.
+            self?.reportDefaultRate()
+        }
         player.event.updateDuration.addListener(self) { [weak self] _ in self?.publishSnapshot() }
         player.event.fail.addListener(self) { [weak self] _ in
             self?.pendingPosition = nil
@@ -408,9 +424,93 @@ public final class PlayerCore: NSObject {
         publishSnapshot()
     }
 
+    /// The rate JS asked for. Never announced as a remote change: JS saves its own choices, and it
+    /// sets each book's rate right before its queue loads.
     public func setRate(_ rate: Float) {
         player.rate = rate
         publishSnapshot()
+        reportDefaultRate()
+    }
+
+    // MARK: - Remote playback rate
+
+    /// The nearest of `rates` to `rate`; `rate` itself when `rates` is empty.
+    public static func snap(_ rate: Double, to rates: [Double]) -> Double {
+        rates.min(by: { abs($0 - rate) < abs($1 - rate) }) ?? rate
+    }
+
+    /// The first of `rates` faster than `current`, wrapping to the first (slowest) after the last;
+    /// `rates` is in ascending order. A rate the list does not contain — a custom speed the app set,
+    /// 1.35 — moves up to the next one in the list, 1.4.
+    public static func nextRate(after current: Double, in rates: [Double]) -> Double? {
+        guard let first = rates.first else { return nil }
+        return rates.first(where: { $0 > current + 0.001 }) ?? first
+    }
+
+    /// Turn the system's playback-rate command on with `rates`, or off when `rates` is empty.
+    ///
+    /// The handler lives here rather than in `TrackPlayer.swift` beside the transport handlers so it
+    /// is registered once per process and survives a JS reload: it only ever talks to the engine.
+    /// SwiftAudioEx's `RemoteCommandController` has no case for this command, so it never touches it.
+    public func configureRemotePlaybackRates(_ rates: [Double]) {
+        let valid = rates.filter { $0.isFinite && $0 > 0 }
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { return }
+            self.remotePlaybackRates = valid
+            let command = MPRemoteCommandCenter.shared().changePlaybackRateCommand
+            if valid.isEmpty {
+                if let target = self.changePlaybackRateTarget {
+                    command.removeTarget(target)
+                    self.changePlaybackRateTarget = nil
+                }
+                command.isEnabled = false
+                return
+            }
+            command.supportedPlaybackRates = valid.map { NSNumber(value: $0) }
+            if self.changePlaybackRateTarget == nil {
+                self.changePlaybackRateTarget = command.addTarget { event in
+                    guard let event = event as? MPChangePlaybackRateCommandEvent else {
+                        return .commandFailed
+                    }
+                    PlayerCore.shared.applyRemoteRate(Double(event.playbackRate))
+                    return .success
+                }
+            }
+            command.isEnabled = true
+        }
+    }
+
+    /// A remote speed control asked for `requested`: snap it to ``remotePlaybackRates``, apply it,
+    /// publish, and post ``remoteRateDidChange``. Returns the rate applied. Call on main.
+    @discardableResult
+    public func applyRemoteRate(_ requested: Double) -> Double {
+        let rate = Self.snap(requested, to: remotePlaybackRates)
+        player.rate = Float(rate)
+        publishSnapshot()
+        reportDefaultRate()
+        NSLog("RNTP-Transport: applied remote rate natively: \(requested) -> \(rate)")
+        var userInfo: [String: Any] = [Self.rateKey: rate]
+        if let trackId = activeTrackId { userInfo[Self.trackIdKey] = trackId }
+        NotificationCenter.default.post(name: Self.remoteRateDidChange, object: self, userInfo: userInfo)
+        return rate
+    }
+
+    /// CarPlay's playback-rate button: the next of ``remotePlaybackRates``, wrapping from the fastest
+    /// to the slowest. The button's handler only says "tapped", so the cycle is the app's to define.
+    /// A no-op while no rates are configured. Call on main.
+    @objc public func cycleRemoteRate() {
+        guard let next = Self.nextRate(after: Double(player.rate), in: remotePlaybackRates) else { return }
+        applyRemoteRate(next)
+    }
+
+    /// `MPNowPlayingInfoPropertyDefaultPlaybackRate`: the rate the item plays at when it plays.
+    /// SwiftAudioEx reports `PlaybackRate` as 0 while paused, so this is what a paused CarPlay rate
+    /// button and the lock screen read the chosen speed from.
+    private func reportDefaultRate() {
+        guard player.automaticallyUpdateNowPlayingInfo, player.currentItem != nil else { return }
+        player.nowPlayingInfoController.set(
+            keyValue: NowPlayingInfoProperty.defaultPlaybackRate(Double(player.rate))
+        )
     }
 
     // MARK: - stopAt

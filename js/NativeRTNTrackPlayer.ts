@@ -219,6 +219,13 @@ export const Capability = {
   Like: 'like',
   Dislike: 'dislike',
   Bookmark: 'bookmark',
+  /**
+   * A remote playback-speed control: `changePlaybackRateCommand` on iOS (lock screen, Control
+   * Center, Watch; CarPlay's rate button drives the same engine path), a speed button in the media
+   * session's media button preferences on Android (notification, Android Auto). Needs
+   * {@link UpdateOptions.playbackRates}.
+   */
+  ChangePlaybackRate: 'changePlaybackRate',
 } as const;
 
 export interface FeedbackOptions {
@@ -242,6 +249,12 @@ export interface UpdateOptions {
   dislikeOptions?: FeedbackOptions;
   bookmarkOptions?: FeedbackOptions;
   capabilities?: Array<string>;
+  /**
+   * The rates a remote speed control offers, in ascending order (a tap on a cycling button moves to
+   * the next one up from the current rate, and wraps). Any rate a remote asks for is snapped to the
+   * nearest of these. Only used with {@link Capability.ChangePlaybackRate}.
+   */
+  playbackRates?: Array<Double>;
   notificationCapabilities?: Array<string>;
   compactCapabilities?: Array<string>;
   icon?: Object;
@@ -429,6 +442,13 @@ export interface Spec extends TurboModule {
   readonly onRemoteJumpForward: EventEmitter<{ interval: number }>;
   readonly onRemoteJumpBackward: EventEmitter<{ interval: number }>;
   readonly onRemoteBookmark: EventEmitter<void>;
+  /**
+   * A remote speed control changed the rate — lock screen, CarPlay, the notification, Android Auto,
+   * a Bluetooth or Wear controller. Like the other transport events it has **already been applied**
+   * by the engine (snapped to {@link UpdateOptions.playbackRates}): handle it as bookkeeping only.
+   * Never emitted for `setRate` / `setPlaybackRate` called from JS.
+   */
+  readonly onRemoteSetRate: EventEmitter<{ rate: Double }>;
   readonly onRemotePlayId: EventEmitter<{ id: string }>;
   readonly onRemoteBrowse: EventEmitter<{ mediaId: string }>;
   

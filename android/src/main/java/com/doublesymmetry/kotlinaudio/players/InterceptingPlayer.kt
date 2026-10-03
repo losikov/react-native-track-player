@@ -6,6 +6,7 @@ import android.os.Looper
 import androidx.media3.common.C
 import androidx.media3.common.ForwardingPlayer
 import androidx.media3.common.MediaItem
+import androidx.media3.common.PlaybackParameters
 import androidx.media3.common.Player
 import androidx.media3.common.util.UnstableApi
 import com.doublesymmetry.kotlinaudio.models.AAMediaSessionCallBack
@@ -289,6 +290,25 @@ class InterceptingPlayer(
                 onAction(MediaSessionCallback.REWIND)
             }
         }
+    }
+
+    /**
+     * A controller asked for a speed — a Bluetooth or Wear controller's speed control, or a legacy
+     * `TransportControls.setPlaybackSpeed`. The app's own `setRate` never comes through here: it goes
+     * to the engine directly. When set (by `MusicService.configureSessionPlayer`) the request is
+     * handed over whole — the service snaps it to the app's rates, applies it, saves nothing itself
+     * but tells the app and JS — instead of reaching ExoPlayer unsnapped.
+     */
+    var onRemoteSpeed: ((Float) -> Unit)? = null
+
+    override fun setPlaybackSpeed(speed: Float) {
+        val handler = onRemoteSpeed ?: return super.setPlaybackSpeed(speed)
+        handler(speed)
+    }
+
+    override fun setPlaybackParameters(playbackParameters: PlaybackParameters) {
+        val handler = onRemoteSpeed ?: return super.setPlaybackParameters(playbackParameters)
+        handler(playbackParameters.speed)
     }
 
     // Next/previous are never applied natively: JS decides what they mean (chapter navigation, the

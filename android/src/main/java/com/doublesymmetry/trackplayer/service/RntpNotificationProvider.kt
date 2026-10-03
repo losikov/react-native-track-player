@@ -22,8 +22,9 @@ import com.google.common.collect.ImmutableList
  * previous / play-pause / next with no ±10 s jumps.
  *
  * Button order reproduces `PlayerNotificationManager`'s: previous, rewind, play/pause, forward,
- * next, stop. The compact view (the collapsed notification, three slots) takes whichever of those
- * the app listed in `compactCapabilities`, in the same order.
+ * next, stop — then the session's custom buttons (playback speed). The compact view (the collapsed
+ * notification, three slots) takes whichever of those the app listed in `compactCapabilities`, in the
+ * same order.
  *
  * Channel id and notification id are the values KotlinAudio used, so an upgrading install keeps the
  * channel the user has already configured rather than silently getting a second one.
@@ -90,6 +91,11 @@ class RntpNotificationProvider(context: Context) : DefaultMediaNotificationProvi
         add(Capability.JUMP_FORWARD, CommandButton.ICON_SKIP_FORWARD_10, forwardIcon, Player.COMMAND_SEEK_FORWARD, "Forward")
         add(Capability.SKIP_TO_NEXT, CommandButton.ICON_NEXT, nextIcon, Player.COMMAND_SEEK_TO_NEXT, "Next")
         add(Capability.STOP, CommandButton.ICON_STOP, stopIcon, Player.COMMAND_STOP, "Stop")
+
+        // The session's own custom buttons (the speed button, see `MusicService.refreshSpeedButton`)
+        // after the transport ones and outside the compact view. media3's default provider would add
+        // them itself; this override has to do it by hand.
+        customLayout.filter { it.sessionCommand != null && it.isEnabled }.forEach { buttons += it }
 
         return ImmutableList.copyOf(buttons)
     }

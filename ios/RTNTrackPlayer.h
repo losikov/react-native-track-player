@@ -17,6 +17,7 @@
 - (void)emitRemoteJumpForward:(NSDictionary *)event;
 - (void)emitRemoteJumpBackward:(NSDictionary *)event;
 - (void)emitRemoteBookmark;
+- (void)emitRemoteSetRate:(NSDictionary *)event;
 - (void)emitRemoteDuck:(NSDictionary *)event;
 @end
 

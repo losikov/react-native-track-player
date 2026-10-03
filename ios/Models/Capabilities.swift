@@ -11,12 +11,15 @@ import SwiftAudioEx
 
 enum Capability: String {
     case play, pause, togglePlayPause, stop, next, previous, jumpForward, jumpBackward, seek, like, dislike, bookmark
+    /// Configured by `PlayerCore.configureRemotePlaybackRates`, not through SwiftAudioEx's
+    /// `RemoteCommand`, which has no rate case: it maps to nil.
+    case changePlaybackRate
 
     func mapToPlayerCommand(forwardJumpInterval: NSNumber?,
                             backwardJumpInterval: NSNumber?,
                             likeOptions: [String: Any]?,
                             dislikeOptions: [String: Any]?,
-                            bookmarkOptions: [String: Any]?) -> RemoteCommand {
+                            bookmarkOptions: [String: Any]?) -> RemoteCommand? {
         switch self {
         case .stop:
             return .stop
@@ -48,6 +51,8 @@ enum Capability: String {
             return .bookmark(isActive: bookmarkOptions?["isActive"] as? Bool ?? false,
                              localizedTitle: bookmarkOptions?["title"] as? String ?? "Bookmark",
                              localizedShortTitle: bookmarkOptions?["title"] as? String ?? "Bookmark")
+        case .changePlaybackRate:
+            return nil
         }
     }
 }

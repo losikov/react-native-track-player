@@ -15,16 +15,20 @@ import androidx.annotation.MainThread
 import androidx.media3.common.MediaItem
 import androidx.media3.common.MediaMetadata
 import androidx.media3.common.util.UnstableApi
+import androidx.media3.session.CommandButton
 import androidx.media3.session.LibraryResult
 import androidx.media3.session.MediaConstants
 import androidx.media3.session.MediaLibraryService
 import androidx.media3.session.MediaSession
 import androidx.media3.session.MediaSessionService
+import androidx.media3.session.SessionCommand
 import androidx.media3.session.SessionError
+import androidx.media3.session.SessionResult
 import com.doublesymmetry.kotlinaudio.models.*
 import com.doublesymmetry.kotlinaudio.players.InterceptingPlayer
 import com.doublesymmetry.kotlinaudio.players.QueuedAudioPlayer
 import com.doublesymmetry.trackplayer.HeadlessJsMediaService
+import com.doublesymmetry.trackplayer.R
 import com.doublesymmetry.trackplayer.extensions.NumberExt.Companion.toMilliseconds
 import com.doublesymmetry.trackplayer.extensions.NumberExt.Companion.toSeconds
 import com.doublesymmetry.trackplayer.extensions.asLibState
@@ -70,6 +74,8 @@ interface MusicServiceEventListener {
     fun onRemoteJumpForward(data: Bundle)
     fun onRemoteJumpBackward(data: Bundle)
     fun onRemoteBookmark()
+    /** A remote speed control changed the rate; already applied. `data["rate"]`. */
+    fun onRemoteSetRate(data: Bundle)
     fun onRemotePlayId(data: Bundle)
     fun onRemoteBrowse(data: Bundle)
     fun onRemotePlayFromSearch(data: Bundle)
@@ -92,6 +98,16 @@ interface MusicServiceEventListener {
  */
 fun interface PlaybackObserver {
     fun onPlaybackChanged()
+}
+
+/**
+ * Native code in the app that keeps a *remote* speed change — the notification's or Android Auto's
+ * speed button, a controller's speed control — with JS possibly asleep. Called on Main after the
+ * engine applied [rate] (already snapped to the app's rates) to the track whose id is [trackId] (null
+ * when nothing is queued). Never called for the app's own `setRate`.
+ */
+fun interface RemoteRateObserver {
+    fun onRemoteRateChanged(rate: Double, trackId: String?)
 }
 
 /**
@@ -213,6 +229,12 @@ class MusicService : HeadlessJsMediaService() {
     private var notificationCapabilities: List<Capability> = emptyList()
     private var compactCapabilities: List<Capability> = emptyList()
 
+    /**
+     * The rates the speed button cycles through, in order; empty while the app has not enabled
+     * [Capability.CHANGE_PLAYBACK_RATE]. See [refreshSpeedButton].
+     */
+    private var playbackRates: List<Float> = emptyList()
+
     private val player: QueuedAudioPlayer
         get() = engine ?: throw IllegalStateException("The player is not initialized")
 
@@ -266,6 +288,7 @@ class MusicService : HeadlessJsMediaService() {
         }
         val session = builder.build()
         librarySession = session
+        refreshSpeedButton()
         setMediaNotificationProvider(notificationProvider)
         // `MediaSessionService` only wires a session to the notification manager in `addSession`,
         // and it calls that itself only when a controller connects or a media button arrives. The
@@ -365,6 +388,11 @@ class MusicService : HeadlessJsMediaService() {
         val backward = latestOptions?.getDouble(BACKWARD_JUMP_INTERVAL_KEY, DEFAULT_JUMP_INTERVAL) ?: DEFAULT_JUMP_INTERVAL
         target.seekForwardIncrementOverrideMs = (forward * 1000).toLong()
         target.seekBackIncrementOverrideMs = (backward * 1000).toLong()
+        // With no rates configured the feature is off: a speed control still works, as it did, but
+        // nothing is snapped, persisted or announced — as on iOS, where the command is then disabled.
+        target.onRemoteSpeed = { speed ->
+            if (playbackRates.isEmpty()) engine?.playbackSpeed = speed else applyRemoteRate(speed)
+        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -572,6 +600,36 @@ class MusicService : HeadlessJsMediaService() {
      * `MediaMetadata.extras`.
      */
     private inner class LibraryCallback : MediaLibraryService.MediaLibrarySession.Callback {
+
+        /**
+         * Each controller keeps the commands media3 grants it by default — a trusted one (the media
+         * notification, Android Auto, System UI) the full set, an untrusted one the read-only set —
+         * plus the speed button's custom command, which media3 would otherwise reject.
+         */
+        override fun onConnect(
+            session: MediaSession,
+            controller: MediaSession.ControllerInfo,
+        ): MediaSession.ConnectionResult {
+            val defaults = MediaSession.ConnectionResult.AcceptedResultBuilder(session, controller).build()
+            return MediaSession.ConnectionResult.AcceptedResultBuilder(session, controller)
+                .setAvailableSessionCommands(
+                    defaults.availableSessionCommands.buildUpon().add(CYCLE_PLAYBACK_SPEED_COMMAND).build()
+                )
+                .build()
+        }
+
+        override fun onCustomCommand(
+            session: MediaSession,
+            controller: MediaSession.ControllerInfo,
+            customCommand: SessionCommand,
+            args: Bundle,
+        ): ListenableFuture<SessionResult> {
+            if (customCommand.customAction == CYCLE_PLAYBACK_SPEED_ACTION) {
+                cycleRemoteRate()
+                return Futures.immediateFuture(SessionResult(SessionResult.RESULT_SUCCESS))
+            }
+            return super.onCustomCommand(session, controller, customCommand, args)
+        }
 
         override fun onGetLibraryRoot(
             session: MediaLibraryService.MediaLibrarySession,
@@ -1049,6 +1107,12 @@ class MusicService : HeadlessJsMediaService() {
         notificationCapabilities = parseCapabilities(options.getStringArrayList("notificationCapabilities"))
         compactCapabilities = parseCapabilities(options.getStringArrayList("compactCapabilities"))
         if (notificationCapabilities.isEmpty()) notificationCapabilities = capabilities
+        playbackRates = if (capabilities.contains(Capability.CHANGE_PLAYBACK_RATE)) {
+            playbackRatesFrom(options)
+        } else {
+            emptyList()
+        }
+        refreshSpeedButton()
 
         notificationProvider.notificationCapabilities = notificationCapabilities
         notificationProvider.compactCapabilities = compactCapabilities
@@ -1239,10 +1303,100 @@ class MusicService : HeadlessJsMediaService() {
     @MainThread
     fun getRate(): Float = player.playbackSpeed
 
+    /**
+     * The rate JS asked for. Never announced as a remote change — JS saves its own choices, and sets
+     * the loaded book's rate right after every load — but the speed button follows it.
+     */
     @MainThread
     fun setRate(value: Float) {
         player.playbackSpeed = value
+        refreshSpeedButton()
     }
+
+    // region remote playback rate
+
+    /**
+     * A remote asked for [requested]: snap it to [playbackRates], apply it on the engine, and only
+     * then tell the app ([RemoteRateObserver], which persists it) and JS (`onRemoteSetRate`, which
+     * does bookkeeping only) — the same native-first order as the transport commands.
+     */
+    @MainThread
+    fun applyRemoteRate(requested: Float) {
+        val engine = engine ?: return
+        val rate = PlaybackRates.snap(requested, playbackRates)
+        engine.playbackSpeed = rate
+        refreshSpeedButton()
+        Timber.tag("RNTP-Transport").d("applied remote rate natively: %s -> %s", requested, rate)
+        val trackId = getActiveTrackId()
+        remoteRateObservers.forEach { it.onRemoteRateChanged(rate.toDouble(), trackId) }
+        trackPlayerModule?.onRemoteSetRate(Bundle().apply { putDouble("rate", rate.toDouble()) })
+    }
+
+    /**
+     * The speed button: the next of [playbackRates] above the current rate, wrapping from the fastest
+     * to the slowest. From a custom speed (1.35, set in the app) it goes up to the next preset (1.4).
+     */
+    @MainThread
+    fun cycleRemoteRate() {
+        val current = engine?.playbackSpeed ?: return
+        val next = PlaybackRates.next(current, playbackRates) ?: return
+        applyRemoteRate(next)
+    }
+
+    /**
+     * The speed button, in the session's media button preferences — media3's mechanism for a custom
+     * action, which the notification, System UI's media controls and Android Auto (as a legacy custom
+     * action) all render. Its icon shows the current rate. Removed while no rates are configured.
+     */
+    @MainThread
+    private fun refreshSpeedButton() {
+        val session = librarySession ?: return
+        if (playbackRates.isEmpty()) {
+            if (session.mediaButtonPreferences.isNotEmpty()) session.setMediaButtonPreferences(ImmutableList.of())
+            return
+        }
+        // The rate as it is, not snapped: a custom speed set in the app (1.35) is named as itself, and
+        // shown with the generic speed icon since no drawable says "1.35x".
+        val rate = engine?.playbackSpeed ?: 1f
+        val preset = PlaybackRates.matching(rate, playbackRates)
+        val button = CommandButton.Builder(preset?.let { speedIcon(it) } ?: CommandButton.ICON_PLAYBACK_SPEED)
+            .setSessionCommand(CYCLE_PLAYBACK_SPEED_COMMAND)
+            .setDisplayName("Speed ${PlaybackRates.label(rate)}×")
+            .apply { preset?.let { speedCustomIcon(it) }?.let { setCustomIconResId(it) } }
+            .setSlots(CommandButton.SLOT_OVERFLOW)
+            .build()
+        session.setMediaButtonPreferences(ImmutableList.of(button))
+    }
+
+    /** media3's own speed icons, where it has one for [rate]. */
+    private fun speedIcon(rate: Float): Int = when (rate) {
+        0.5f -> CommandButton.ICON_PLAYBACK_SPEED_0_5
+        0.8f -> CommandButton.ICON_PLAYBACK_SPEED_0_8
+        1f -> CommandButton.ICON_PLAYBACK_SPEED_1_0
+        1.2f -> CommandButton.ICON_PLAYBACK_SPEED_1_2
+        1.5f -> CommandButton.ICON_PLAYBACK_SPEED_1_5
+        1.8f -> CommandButton.ICON_PLAYBACK_SPEED_1_8
+        2f -> CommandButton.ICON_PLAYBACK_SPEED_2_0
+        else -> CommandButton.ICON_PLAYBACK_SPEED
+    }
+
+    /** Ours, for the rates media3 has no icon for; otherwise media3's icon is used as is. */
+    private fun speedCustomIcon(rate: Float): Int? = when (rate) {
+        1.1f -> R.drawable.rntp_playback_speed_1_1
+        1.3f -> R.drawable.rntp_playback_speed_1_3
+        1.4f -> R.drawable.rntp_playback_speed_1_4
+        1.75f -> R.drawable.rntp_playback_speed_1_75
+        else -> null
+    }
+
+    /** `playbackRates` arrives as a list of numbers (`Arguments.toBundle` makes it an `ArrayList`). */
+    private fun playbackRatesFrom(options: Bundle): List<Float> {
+        @Suppress("DEPRECATION")
+        val raw = options.get(PLAYBACK_RATES_KEY) as? List<*> ?: return emptyList()
+        return raw.mapNotNull { (it as? Number)?.toFloat() }.filter { it.isFinite() && it > 0f }
+    }
+
+    // endregion
 
     @MainThread
     fun getRepeatMode(): RepeatMode = player.playerOptions.repeatMode
@@ -1501,6 +1655,11 @@ class MusicService : HeadlessJsMediaService() {
         const val BACK_BUFFER_KEY = "backBuffer"
 
         const val FORWARD_JUMP_INTERVAL_KEY = "forwardJumpInterval"
+        const val PLAYBACK_RATES_KEY = "playbackRates"
+
+        /** The speed button's custom command. */
+        const val CYCLE_PLAYBACK_SPEED_ACTION = "com.doublesymmetry.trackplayer.CYCLE_PLAYBACK_SPEED"
+        private val CYCLE_PLAYBACK_SPEED_COMMAND = SessionCommand(CYCLE_PLAYBACK_SPEED_ACTION, Bundle.EMPTY)
         const val BACKWARD_JUMP_INTERVAL_KEY = "backwardJumpInterval"
         const val PROGRESS_UPDATE_EVENT_INTERVAL_KEY = "progressUpdateEventInterval"
 
@@ -1552,6 +1711,17 @@ class MusicService : HeadlessJsMediaService() {
             playbackObservers.remove(observer)
         }
 
+        // Static for the same reason: the app registers once per process, before any service exists.
+        private val remoteRateObservers = java.util.concurrent.CopyOnWriteArraySet<RemoteRateObserver>()
+
+        fun addRemoteRateObserver(observer: RemoteRateObserver) {
+            remoteRateObservers.add(observer)
+        }
+
+        fun removeRemoteRateObserver(observer: RemoteRateObserver) {
+            remoteRateObservers.remove(observer)
+        }
+
         /**
          * `LegacyConversions.convertToLegacyErrorCode` run backwards.
          *
@@ -1597,6 +1767,7 @@ class MusicService : HeadlessJsMediaService() {
                 "like" -> Capability.LIKE
                 "dislike" -> Capability.DISLIKE
                 "bookmark" -> Capability.BOOKMARK
+                "changePlaybackRate" -> Capability.CHANGE_PLAYBACK_RATE
                 else -> null
             }
         } ?: emptyList()

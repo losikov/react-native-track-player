@@ -88,6 +88,20 @@ public class TrackPlayer: NSObject, AudioSessionControllerDelegate {
                 ])
             }
         )
+
+        // A remote speed control (lock screen, Watch, CarPlay's rate button) — already applied by the
+        // engine, so JS only records it, exactly like the transport events.
+        observerTokens.append(
+            NotificationCenter.default.addObserver(
+                forName: PlayerCore.remoteRateDidChange,
+                object: core,
+                queue: .main
+            ) { [weak self] note in
+                self?.eventEmitter?.emitRemoteSetRate([
+                    "rate": note.userInfo?[PlayerCore.rateKey] as? Double ?? 1,
+                ])
+            }
+        )
     }
     
     @objc
@@ -171,6 +185,7 @@ public class TrackPlayer: NSObject, AudioSessionControllerDelegate {
             "CAPABILITY_LIKE": Capability.like.rawValue,
             "CAPABILITY_DISLIKE": Capability.dislike.rawValue,
             "CAPABILITY_BOOKMARK": Capability.bookmark.rawValue,
+            "CAPABILITY_CHANGE_PLAYBACK_RATE": Capability.changePlaybackRate.rawValue,
 
             "REPEAT_OFF": RepeatMode.off.rawValue,
             "REPEAT_TRACK": RepeatMode.track.rawValue,
@@ -452,9 +467,15 @@ public class TrackPlayer: NSObject, AudioSessionControllerDelegate {
         forwardJumpInterval = options["forwardJumpInterval"] as? NSNumber ?? forwardJumpInterval
         backwardJumpInterval = options["backwardJumpInterval"] as? NSNumber ?? backwardJumpInterval
 
+        // Not a SwiftAudioEx `RemoteCommand`: the engine owns the playback-rate command itself.
+        let playbackRates = (options["playbackRates"] as? [NSNumber])?.map { $0.doubleValue } ?? []
+        core.configureRemotePlaybackRates(
+            capabilitiesStr.contains(Capability.changePlaybackRate.rawValue) ? playbackRates : []
+        )
+
         player.remoteCommands = capabilitiesStr
             .compactMap { Capability(rawValue: $0) }
-            .map { capability in
+            .compactMap { capability in
                 capability.mapToPlayerCommand(
                     forwardJumpInterval: forwardJumpInterval,
                     backwardJumpInterval: backwardJumpInterval,

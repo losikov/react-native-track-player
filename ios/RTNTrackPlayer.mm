@@ -164,6 +164,16 @@ RCT_EXPORT_MODULE()
                 NSLog(@"Error processing capabilities");
             }
         }
+        // Hold the optional: `playbackRates()` returns a temporary, and a range-for over its
+        // `.value()` iterates a LazyVector whose converter block died with it (SIGSEGV at 0x10).
+        auto playbackRatesOption = options.playbackRates();
+        if (playbackRatesOption.has_value()) {
+            NSMutableArray *playbackRates = [NSMutableArray array];
+            for (double rate : playbackRatesOption.value()) {
+                [playbackRates addObject:@(rate)];
+            }
+            config[@"playbackRates"] = playbackRates;
+        }
         if (options.notificationCapabilities().has_value()) {
             NSMutableArray *notificationCapabilities = [NSMutableArray array];
             try {
@@ -303,6 +313,10 @@ RCT_EXPORT_MODULE()
 
 - (void)emitRemoteBookmark {
     [self emitIfAttached:^{ [self emitOnRemoteBookmark]; }];
+}
+
+- (void)emitRemoteSetRate:(NSDictionary *)event {
+    [self emitIfAttached:^{ [self emitOnRemoteSetRate:event]; }];
 }
 
 // MARK: - Setup and configuration
