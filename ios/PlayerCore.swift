@@ -17,6 +17,7 @@
 //  method and event it had still works exactly as before.
 //
 
+import AVFoundation
 import Combine
 import Foundation
 import MediaPlayer
@@ -164,11 +165,17 @@ public final class PlayerCore: NSObject {
     /// `userInfo[trackIdKey]` the ``activeTrackId`` it applies to, absent when nothing is queued.
     /// App code persists the rate from here, which is why it is posted whether or not JS is alive.
     @objc public static let remoteRateDidChange = Notification.Name("PlayerCore.remoteRateDidChange")
+    /// Posted when a queued item played to its end by itself — never for a skip, a seek or a load.
+    /// `userInfo[trackIdKey]` is that item's `id`; `userInfo[pausedKey]` is true when
+    /// ``pauseAtEndOfItem`` stopped playback there. Posted on the thread AVFoundation reports the end
+    /// on, before the queue moves on.
+    @objc public static let itemDidPlayToEnd = Notification.Name("PlayerCore.itemDidPlayToEnd")
 
     public static let snapshotKey = "snapshot"
     public static let positionKey = "position"
     @objc public static let rateKey = "rate"
     @objc public static let trackIdKey = "trackId"
+    @objc public static let pausedKey = "paused"
 
     /// The queue. `TrackPlayer.swift` still talks to it directly for everything the snapshot does
     /// not cover (metadata, remote commands, repeat mode); transport goes through the commands below
@@ -201,6 +208,13 @@ public final class PlayerCore: NSObject {
     /// one. Set through ``configureRemotePlaybackRates(_:)``, read on main.
     public private(set) var remotePlaybackRates: [Double] = []
     private var changePlaybackRateTarget: Any?
+
+    /// media3's `pauseAtEndOfMediaItems`: while true, an item that plays to its end pauses playback
+    /// instead of playing on, and the queue stands, paused, at the start of the next item — or ends
+    /// as usual after the last. Skips, seeks and loads are not ends. App code arms it (a sleep timer's
+    /// "end of chapter"); ``setStopAt(_:)`` stays free for its own use.
+    @objc public var pauseAtEndOfItem = false
+    private var itemEndObserver: NSObjectProtocol?
 
     /// See ``commandGeneration``. Commands run on the module queue and on main; readers on either.
     private let commandLock = NSLock()
@@ -235,6 +249,15 @@ public final class PlayerCore: NSObject {
             self.pendingPosition = nil
             self.publishSnapshot()
             self.postProgressJump(position: data.seconds)
+        }
+        // Synchronous, on the thread AVFoundation posts from: SwiftAudioEx's own handler moves the
+        // queue on, and a pause has to be in place before the next item is loaded with the intent.
+        itemEndObserver = NotificationCenter.default.addObserver(
+            forName: .AVPlayerItemDidPlayToEndTime,
+            object: nil,
+            queue: nil
+        ) { [weak self] note in
+            self?.itemDidPlayToEndTime(note)
         }
         publishSnapshot()
     }
@@ -280,6 +303,26 @@ public final class PlayerCore: NSObject {
     /// Whether the queue has played out.
     @objc public var hasEnded: Bool {
         player.playerState == .ended
+    }
+
+    /// Whether sound is coming out: playing — not loading, buffering or paused — and not held back by
+    /// an interruption (a call). Read live, like ``isRunning``.
+    @objc public var isPlaying: Bool {
+        player.playerState == .playing && suppression == .none
+    }
+
+    /// What `play()` / `pause()` last asked for, read live.
+    @objc public var playWhenReady: Bool {
+        player.playWhenReady
+    }
+
+    /// The player's own volume, 0...1 — not the device's. App code fades with it (a sleep timer).
+    @objc public var volume: Float {
+        get { player.volume }
+        set {
+            player.volume = newValue
+            publishSnapshot()
+        }
     }
 
     /// Moves whenever a load or a skip starts or finishes, and reads -1 while one is running.
@@ -362,6 +405,12 @@ public final class PlayerCore: NSObject {
     public func pause(reason: PlaybackTransportReason = .user) {
         player.pause()
         publishSnapshot(reason: reason)
+    }
+
+    /// A pause app code decides on (a sleep timer running out): ``pause(reason:)`` with reason
+    /// `system`, the path every other pause takes.
+    @objc public func pauseFromApp() {
+        pause(reason: .system)
     }
 
     public func stop(reason: PlaybackTransportReason = .user) {
@@ -558,6 +607,47 @@ public final class PlayerCore: NSObject {
             object: self,
             userInfo: [PlayerCore.positionKey: now]
         )
+    }
+
+    // MARK: - End of an item
+
+    /// An `AVPlayerItem` played to its end. Ours only if its URL is one the queue holds: other
+    /// players in the process post the same notification.
+    ///
+    /// Runs before or after SwiftAudioEx's own handler — NotificationCenter promises no order — so
+    /// the item is found by its URL rather than taken to be the current one. Either way the pause
+    /// lands before the next item plays: `QueuedAudioPlayer` loads it with the intent it finds, and
+    /// even when it read the old intent the load still has an asynchronous asset hop to make.
+    private func itemDidPlayToEndTime(_ note: Notification) {
+        guard let url = ((note.object as? AVPlayerItem)?.asset as? AVURLAsset)?.url,
+              let index = queuedIndex(of: url)
+        else { return }
+        let trackId = (player.items[index] as? Track)?.toObject()["id"] as? String
+        let paused = pauseAtEndOfItem
+        if paused {
+            player.playWhenReady = false
+            publishSnapshot(reason: .system)
+        }
+        var userInfo: [String: Any] = [Self.pausedKey: paused]
+        if let trackId = trackId { userInfo[Self.trackIdKey] = trackId }
+        NotificationCenter.default.post(name: Self.itemDidPlayToEnd, object: self, userInfo: userInfo)
+    }
+
+    /// The queue index of the item whose source is `url`: the current one or the one before it when
+    /// the queue has already moved on, else the first match.
+    private func queuedIndex(of url: URL) -> Int? {
+        let items = player.items
+        let matches = items.indices.filter { Self.sourceURL(of: items[$0]) == url.standardized }
+        let current = player.currentIndex
+        return matches.first(where: { $0 == current }) ?? matches.first(where: { $0 == current - 1 }) ?? matches.first
+    }
+
+    /// The URL `AVPlayerWrapper` builds for an item: a file path for a local item, the string as is
+    /// for a stream.
+    private static func sourceURL(of item: AudioItem) -> URL? {
+        let source = item.getSourceUrl()
+        let url = item.getSourceType() == .file ? URL(fileURLWithPath: source) : URL(string: source)
+        return url?.standardized
     }
 
     // MARK: - Audio session

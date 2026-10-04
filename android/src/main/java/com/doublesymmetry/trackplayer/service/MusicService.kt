@@ -43,7 +43,9 @@ import com.google.common.util.concurrent.Futures
 import com.google.common.util.concurrent.ListenableFuture
 import com.google.common.util.concurrent.SettableFuture
 import kotlinx.coroutines.*
+import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.flow
+import kotlinx.coroutines.flow.map
 import timber.log.Timber
 import java.util.Locale
 import java.util.concurrent.TimeUnit
@@ -108,6 +110,15 @@ fun interface PlaybackObserver {
  */
 fun interface RemoteRateObserver {
     fun onRemoteRateChanged(rate: Double, trackId: String?)
+}
+
+/**
+ * Native code in the app that needs to know a queue item played to its end by itself — never a skip,
+ * a seek or a load. Called on Main with the [trackId] of the item that ended (null when it has none)
+ * and [pausedAtEnd], true when [MusicService.setPauseAtEndOfItem] stopped playback there.
+ */
+fun interface ItemEndObserver {
+    fun onItemPlayedToEnd(trackId: String?, pausedAtEnd: Boolean)
 }
 
 /**
@@ -235,6 +246,9 @@ class MusicService : HeadlessJsMediaService() {
      */
     private var playbackRates: List<Float> = emptyList()
 
+    /** See [setPauseAtEndOfItem]; kept here so an engine created later starts with it. */
+    private var pauseAtEndOfItem = false
+
     private val player: QueuedAudioPlayer
         get() = engine ?: throw IllegalStateException("The player is not initialized")
 
@@ -312,6 +326,7 @@ class MusicService : HeadlessJsMediaService() {
         created.automaticallyUpdateNotificationMetadata =
             options?.getBoolean(AUTO_UPDATE_METADATA, true) ?: true
         engine = created
+        created.setPauseAtEndOfItem(pauseAtEndOfItem)
         observeEvents()
         return created
     }
@@ -1216,6 +1231,22 @@ class MusicService : HeadlessJsMediaService() {
         player.clearStopAt()
     }
 
+    /**
+     * media3's `pauseAtEndOfMediaItems`, as iOS's `PlayerCore.pauseAtEndOfItem`: while true, an item
+     * that plays to its end pauses playback instead of playing on, and the queue then stands, paused,
+     * at the start of the next item — or ends as usual after the last. Skips, seeks and loads are not
+     * ends. App code arms it (a sleep timer's "end of chapter"); [setStopAt] stays free for its own use.
+     */
+    @MainThread
+    fun setPauseAtEndOfItem(pause: Boolean) {
+        pauseAtEndOfItem = pause
+        engine?.setPauseAtEndOfItem(pause)
+    }
+
+    /** The engine's state model — `isPlaying`, `playWhenReady`, `suppression` — or null before it exists. */
+    val playerSnapshot: PlayerSnapshot?
+        get() = engine?.state?.value
+
     @MainThread
     fun move(fromIndex: Int, toIndex: Int) {
         player.move(fromIndex, toIndex)
@@ -1514,6 +1545,8 @@ class MusicService : HeadlessJsMediaService() {
                 notifyPlaybackObservers()
 
                 if (it == AudioPlayerState.ENDED && engine?.nextItem == null) {
+                    // The last item's end. With the pause armed it was reported as a pause already.
+                    if (!pauseAtEndOfItem) notifyItemEnd(engine?.currentIndex, pausedAtEnd = false)
                     emitQueueEndedEvent()
                 }
             }
@@ -1521,6 +1554,9 @@ class MusicService : HeadlessJsMediaService() {
 
         eventJobs += scope.launch {
             event.audioItemTransition.collect {
+                if (it is AudioItemTransitionReason.AUTO) {
+                    notifyItemEnd(engine?.previousIndex, pausedAtEnd = false)
+                }
                 notifyPlaybackObservers()
                 if (it !is AudioItemTransitionReason.REPEAT) {
                     emitPlaybackTrackChangedEvents(
@@ -1565,8 +1601,22 @@ class MusicService : HeadlessJsMediaService() {
                 trackPlayerModule?.onPlaybackPlayWhenReadyChanged(Bundle().apply {
                     putBoolean("playWhenReady", it.playWhenReady)
                 })
+                if (it.pausedBecauseReachedEnd) {
+                    notifyItemEnd(engine?.currentIndex, pausedAtEnd = true)
+                    // Stand at the start of the next item, as iOS's queue does once it paused at an end.
+                    if (engine?.nextItem != null) player.next()
+                }
                 notifyPlaybackObservers()
             }
+        }
+
+        eventJobs += scope.launch {
+            // A call or a stall stops the sound without moving the legacy state, so native code that
+            // follows whether sound is coming out hears it from the snapshot.
+            player.state
+                .map { it.isPlaying to it.suppression }
+                .distinctUntilChanged()
+                .collect { notifyPlaybackObservers() }
         }
 
         eventJobs += scope.launch {
@@ -1588,6 +1638,11 @@ class MusicService : HeadlessJsMediaService() {
 
     private fun notifyPlaybackObservers() {
         playbackObservers.forEach { it.onPlaybackChanged() }
+    }
+
+    private fun notifyItemEnd(index: Int?, pausedAtEnd: Boolean) {
+        val trackId = index?.let { tracks.getOrNull(it) }?.originalItem?.getString("id")
+        itemEndObservers.forEach { it.onItemPlayedToEnd(trackId, pausedAtEnd) }
     }
 
     private fun emitPlaybackTrackChangedEvents(index: Int?, previousIndex: Int?, oldPosition: Double) {
@@ -1720,6 +1775,17 @@ class MusicService : HeadlessJsMediaService() {
 
         fun removeRemoteRateObserver(observer: RemoteRateObserver) {
             remoteRateObservers.remove(observer)
+        }
+
+        // Static for the same reason as the two above.
+        private val itemEndObservers = java.util.concurrent.CopyOnWriteArraySet<ItemEndObserver>()
+
+        fun addItemEndObserver(observer: ItemEndObserver) {
+            itemEndObservers.add(observer)
+        }
+
+        fun removeItemEndObserver(observer: ItemEndObserver) {
+            itemEndObservers.remove(observer)
         }
 
         /**
