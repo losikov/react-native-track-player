@@ -165,10 +165,10 @@ public final class PlayerCore: NSObject {
     /// `userInfo[trackIdKey]` the ``activeTrackId`` it applies to, absent when nothing is queued.
     /// App code persists the rate from here, which is why it is posted whether or not JS is alive.
     @objc public static let remoteRateDidChange = Notification.Name("PlayerCore.remoteRateDidChange")
-    /// Posted when a queued item played to its end by itself — never for a skip, a seek or a load.
-    /// `userInfo[trackIdKey]` is that item's `id`; `userInfo[pausedKey]` is true when
-    /// ``pauseAtEndOfItem`` stopped playback there. Posted on the thread AVFoundation reports the end
-    /// on, before the queue moves on.
+    /// Posted once when a queued item played to its end by itself — never for a skip, a seek or a
+    /// load. `userInfo[trackIdKey]` is that item's `id`; `userInfo[pausedKey]` is true when
+    /// ``pauseAtEndOfItem`` stopped playback there (never at the last item: that end is the queue's).
+    /// Posted on the thread AVFoundation reports the end on; the queue may already have moved on.
     @objc public static let itemDidPlayToEnd = Notification.Name("PlayerCore.itemDidPlayToEnd")
 
     public static let snapshotKey = "snapshot"
@@ -209,10 +209,11 @@ public final class PlayerCore: NSObject {
     public private(set) var remotePlaybackRates: [Double] = []
     private var changePlaybackRateTarget: Any?
 
-    /// media3's `pauseAtEndOfMediaItems`: while true, an item that plays to its end pauses playback
-    /// instead of playing on, and the queue stands, paused, at the start of the next item — or ends
-    /// as usual after the last. Skips, seeks and loads are not ends. App code arms it (a sleep timer's
-    /// "end of chapter"); ``setStopAt(_:)`` stays free for its own use.
+    /// media3's `pauseAtEndOfMediaItems`: while true, an item that plays to its end with a next item
+    /// queued pauses playback there, and the queue stands, paused, at the start of that next item.
+    /// The last item's end is the queue's end, as without it. Skips, seeks and loads are not ends. The
+    /// pause is published with reason `system`. App code arms it (a sleep timer's "end of chapter");
+    /// ``setStopAt(_:)`` stays free for its own use.
     @objc public var pauseAtEndOfItem = false
     private var itemEndObserver: NSObjectProtocol?
 
@@ -620,10 +621,12 @@ public final class PlayerCore: NSObject {
     /// even when it read the old intent the load still has an asynchronous asset hop to make.
     private func itemDidPlayToEndTime(_ note: Notification) {
         guard let url = ((note.object as? AVPlayerItem)?.asset as? AVURLAsset)?.url,
-              let index = queuedIndex(of: url)
+              let ended = queuedItem(of: url)
         else { return }
-        let trackId = (player.items[index] as? Track)?.toObject()["id"] as? String
-        let paused = pauseAtEndOfItem
+        let trackId = (ended.item as? Track)?.toObject()["id"] as? String
+        // Android arms media3's pause only while a next item exists: the last item's end stays the
+        // queue's end on both platforms.
+        let paused = pauseAtEndOfItem && ended.hasNext
         if paused {
             player.playWhenReady = false
             publishSnapshot(reason: .system)
@@ -633,13 +636,19 @@ public final class PlayerCore: NSObject {
         NotificationCenter.default.post(name: Self.itemDidPlayToEnd, object: self, userInfo: userInfo)
     }
 
-    /// The queue index of the item whose source is `url`: the current one or the one before it when
-    /// the queue has already moved on, else the first match.
-    private func queuedIndex(of url: URL) -> Int? {
+    /// The queued item whose source is `url` — the current one, or the one before it when the queue
+    /// has already moved on, else the first match — and whether another item follows it. Read from
+    /// one copy of the queue: a load or a reset on the module queue may change `player.items` at any
+    /// moment, and an index into a later copy could be out of range.
+    private func queuedItem(of url: URL) -> (item: AudioItem, hasNext: Bool)? {
         let items = player.items
         let matches = items.indices.filter { Self.sourceURL(of: items[$0]) == url.standardized }
         let current = player.currentIndex
-        return matches.first(where: { $0 == current }) ?? matches.first(where: { $0 == current - 1 }) ?? matches.first
+        guard let index = matches.first(where: { $0 == current })
+            ?? matches.first(where: { $0 == current - 1 })
+            ?? matches.first
+        else { return nil }
+        return (items[index], index < items.count - 1 || player.repeatMode == .queue)
     }
 
     /// The URL `AVPlayerWrapper` builds for an item: a file path for a local item, the string as is

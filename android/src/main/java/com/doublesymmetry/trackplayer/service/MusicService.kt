@@ -114,11 +114,21 @@ fun interface RemoteRateObserver {
 
 /**
  * Native code in the app that needs to know a queue item played to its end by itself — never a skip,
- * a seek or a load. Called on Main with the [trackId] of the item that ended (null when it has none)
- * and [pausedAtEnd], true when [MusicService.setPauseAtEndOfItem] stopped playback there.
+ * a seek or a load. Called on Main, once per end, with the [trackId] of the item that ended (null
+ * when it has none) and [pausedAtEnd], true when [MusicService.setPauseAtEndOfItem] stopped playback
+ * there. The last item's end is the queue's end and reports false.
  */
 fun interface ItemEndObserver {
     fun onItemPlayedToEnd(trackId: String?, pausedAtEnd: Boolean)
+}
+
+/**
+ * Native code in the app that follows whether sound is coming out: called on Main when the engine's
+ * `isPlaying` or `suppression` changes — a call or a stall stops the sound without moving the legacy
+ * state, so [PlaybackObserver] does not hear it. Read the snapshot from [MusicService.playerSnapshot].
+ */
+fun interface AudibilityObserver {
+    fun onAudibilityChanged()
 }
 
 /**
@@ -1233,9 +1243,10 @@ class MusicService : HeadlessJsMediaService() {
 
     /**
      * media3's `pauseAtEndOfMediaItems`, as iOS's `PlayerCore.pauseAtEndOfItem`: while true, an item
-     * that plays to its end pauses playback instead of playing on, and the queue then stands, paused,
-     * at the start of the next item — or ends as usual after the last. Skips, seeks and loads are not
-     * ends. App code arms it (a sleep timer's "end of chapter"); [setStopAt] stays free for its own use.
+     * that plays to its end with a next item queued pauses playback there, and the queue then stands,
+     * paused, at the start of that next item. The last item's end is the queue's end, as without it.
+     * Skips, seeks and loads are not ends. The pause is published with reason `SYSTEM`. App code arms
+     * it (a sleep timer's "end of chapter"); [setStopAt] stays free for its own use.
      */
     @MainThread
     fun setPauseAtEndOfItem(pause: Boolean) {
@@ -1273,6 +1284,15 @@ class MusicService : HeadlessJsMediaService() {
     @MainThread
     fun pause() {
         player.pause()
+    }
+
+    /**
+     * A pause app code decides on (a sleep timer running out), published with reason `SYSTEM` as
+     * iOS's `PlayerCore.pauseFromApp()` is.
+     */
+    @MainThread
+    fun pauseFromApp() {
+        player.pause(TransportReason.SYSTEM)
     }
 
     @MainThread
@@ -1545,8 +1565,8 @@ class MusicService : HeadlessJsMediaService() {
                 notifyPlaybackObservers()
 
                 if (it == AudioPlayerState.ENDED && engine?.nextItem == null) {
-                    // The last item's end. With the pause armed it was reported as a pause already.
-                    if (!pauseAtEndOfItem) notifyItemEnd(engine?.currentIndex, pausedAtEnd = false)
+                    // The last item's end, reported once: the pause at an end is never armed there.
+                    notifyItemEnd(trackIdAt(engine?.currentIndex), pausedAtEnd = false)
                     emitQueueEndedEvent()
                 }
             }
@@ -1555,7 +1575,7 @@ class MusicService : HeadlessJsMediaService() {
         eventJobs += scope.launch {
             event.audioItemTransition.collect {
                 if (it is AudioItemTransitionReason.AUTO) {
-                    notifyItemEnd(engine?.previousIndex, pausedAtEnd = false)
+                    notifyItemEnd(trackIdAt(engine?.previousIndex), pausedAtEnd = false)
                 }
                 notifyPlaybackObservers()
                 if (it !is AudioItemTransitionReason.REPEAT) {
@@ -1602,9 +1622,9 @@ class MusicService : HeadlessJsMediaService() {
                     putBoolean("playWhenReady", it.playWhenReady)
                 })
                 if (it.pausedBecauseReachedEnd) {
-                    notifyItemEnd(engine?.currentIndex, pausedAtEnd = true)
-                    // Stand at the start of the next item, as iOS's queue does once it paused at an end.
-                    if (engine?.nextItem != null) player.next()
+                    // The engine has already moved to the start of the next item, paused, in media3's
+                    // own callback; the item that ended came with the event.
+                    notifyItemEnd(trackIdOf(it.endedItem), pausedAtEnd = true)
                 }
                 notifyPlaybackObservers()
             }
@@ -1612,11 +1632,11 @@ class MusicService : HeadlessJsMediaService() {
 
         eventJobs += scope.launch {
             // A call or a stall stops the sound without moving the legacy state, so native code that
-            // follows whether sound is coming out hears it from the snapshot.
+            // follows whether sound is coming out hears it from the snapshot — its own observers only.
             player.state
                 .map { it.isPlaying to it.suppression }
                 .distinctUntilChanged()
-                .collect { notifyPlaybackObservers() }
+                .collect { audibilityObservers.forEach { observer -> observer.onAudibilityChanged() } }
         }
 
         eventJobs += scope.launch {
@@ -1640,10 +1660,15 @@ class MusicService : HeadlessJsMediaService() {
         playbackObservers.forEach { it.onPlaybackChanged() }
     }
 
-    private fun notifyItemEnd(index: Int?, pausedAtEnd: Boolean) {
-        val trackId = index?.let { tracks.getOrNull(it) }?.originalItem?.getString("id")
+    private fun notifyItemEnd(trackId: String?, pausedAtEnd: Boolean) {
         itemEndObservers.forEach { it.onItemPlayedToEnd(trackId, pausedAtEnd) }
     }
+
+    private fun trackIdAt(index: Int?): String? =
+        index?.let { tracks.getOrNull(it) }?.originalItem?.getString("id")
+
+    private fun trackIdOf(item: AudioItem?): String? =
+        (item as? TrackAudioItem)?.track?.originalItem?.getString("id")
 
     private fun emitPlaybackTrackChangedEvents(index: Int?, previousIndex: Int?, oldPosition: Double) {
         // Only emit the modern playback-active-track-changed event; the legacy
@@ -1786,6 +1811,17 @@ class MusicService : HeadlessJsMediaService() {
 
         fun removeItemEndObserver(observer: ItemEndObserver) {
             itemEndObservers.remove(observer)
+        }
+
+        // Static for the same reason as the ones above.
+        private val audibilityObservers = java.util.concurrent.CopyOnWriteArraySet<AudibilityObserver>()
+
+        fun addAudibilityObserver(observer: AudibilityObserver) {
+            audibilityObservers.add(observer)
+        }
+
+        fun removeAudibilityObserver(observer: AudibilityObserver) {
+            audibilityObservers.remove(observer)
         }
 
         /**

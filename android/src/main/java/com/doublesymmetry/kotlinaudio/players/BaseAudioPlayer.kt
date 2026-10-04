@@ -12,6 +12,7 @@ import androidx.media3.common.Metadata
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
 import androidx.media3.common.Player.Listener
+import androidx.media3.common.Timeline
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.datasource.cache.SimpleCache
 import androidx.media3.exoplayer.DefaultLoadControl
@@ -548,8 +549,22 @@ abstract class BaseAudioPlayer internal constructor(
         publishSnapshot()
     }
 
+    /**
+     * Pause at the end of an item that has a next one (a sleep timer's "end of chapter"); the pause
+     * then moves the queue to the start of that next item, paused ([PlayerListener]). The last item's
+     * end is the queue's end, as without it, so media3's own pause is armed only while a next item
+     * exists, and re-armed whenever the item, the queue or the repeat mode changes.
+     */
     fun setPauseAtEndOfItem(pause: Boolean) {
-        exoPlayer.pauseAtEndOfMediaItems = pause
+        pauseAtEndOfItemRequested = pause
+        applyPauseAtEndOfItem()
+    }
+
+    private var pauseAtEndOfItemRequested = false
+
+    private fun applyPauseAtEndOfItem() {
+        val armed = pauseAtEndOfItemRequested && exoPlayer.hasNextMediaItem()
+        if (exoPlayer.pauseAtEndOfMediaItems != armed) exoPlayer.pauseAtEndOfMediaItems = armed
     }
 
     @CallSuper
@@ -651,6 +666,7 @@ abstract class BaseAudioPlayer internal constructor(
         }
 
         override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
+            applyPauseAtEndOfItem()
             when (reason) {
                 Player.MEDIA_ITEM_TRANSITION_REASON_AUTO -> playerEventHolder.updateAudioItemTransition(
                     AudioItemTransitionReason.AUTO(oldPosition)
@@ -667,14 +683,30 @@ abstract class BaseAudioPlayer internal constructor(
             }
         }
 
+        override fun onTimelineChanged(timeline: Timeline, reason: Int) {
+            applyPauseAtEndOfItem()
+        }
+
+        override fun onRepeatModeChanged(repeatMode: Int) {
+            applyPauseAtEndOfItem()
+        }
+
         override fun onPlayWhenReadyChanged(playWhenReady: Boolean, reason: Int) {
             val pausedBecauseReachedEnd = reason == Player.PLAY_WHEN_READY_CHANGE_REASON_END_OF_MEDIA_ITEM
-            playerEventHolder.updatePlayWhenReadyChange(
-                PlayWhenReadyChangeData(playWhenReady, pausedBecauseReachedEnd)
-            )
-            if (reason == Player.PLAY_WHEN_READY_CHANGE_REASON_AUDIO_FOCUS_LOSS) {
-                transportReason = TransportReason.AUDIO_FOCUS_LOSS
+            if (!pausedBecauseReachedEnd) {
+                playerEventHolder.updatePlayWhenReadyChange(PlayWhenReadyChangeData(playWhenReady, false))
+                if (reason == Player.PLAY_WHEN_READY_CHANGE_REASON_AUDIO_FOCUS_LOSS) {
+                    transportReason = TransportReason.AUDIO_FOCUS_LOSS
+                }
+                return
             }
+            // [setPauseAtEndOfItem]'s pause. The item that ended and the move to the next one are taken
+            // here, in media3's own callback: on a later main-thread turn a play or a load could already
+            // have moved the queue, and a move made then would skip an item.
+            val endedItem = (exoPlayer.currentMediaItem?.localConfiguration?.tag as? AudioItemHolder)?.audioItem
+            if (exoPlayer.hasNextMediaItem()) exoPlayer.seekToNextMediaItem()
+            playerEventHolder.updatePlayWhenReadyChange(PlayWhenReadyChangeData(playWhenReady, true, endedItem))
+            publishSnapshot(TransportReason.SYSTEM)
         }
 
         override fun onPlaybackSuppressionReasonChanged(playbackSuppressionReason: Int) {
