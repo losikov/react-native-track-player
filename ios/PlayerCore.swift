@@ -201,7 +201,12 @@ public final class PlayerCore: NSObject {
     /// seek deferred while the item loaded) clears it again.
     private var pendingPosition: Double?
 
-    private var stopAtTarget: Double?
+    /// The armed stop: where, and the source of the item it was armed on. Written on the module
+    /// queue and read by the poll on main, so only under `stopAtLock`.
+    private var stopAtTarget: (position: Double, itemURL: URL?)?
+    private let stopAtLock = NSLock()
+    /// The poll. Created and invalidated on main only: a `Timer` must be invalidated on the thread
+    /// whose run loop it was added to.
     private var stopAtTimer: Timer?
 
     /// The rates a remote speed control offers, in ascending order; empty while the app has not enabled
@@ -352,7 +357,11 @@ public final class PlayerCore: NSObject {
     }
 
     /// Whether a ``setStopAt(_:)`` is currently armed.
-    public var stopAtPosition: Double? { stopAtTarget }
+    public var stopAtPosition: Double? {
+        stopAtLock.lock()
+        defer { stopAtLock.unlock() }
+        return stopAtTarget?.position
+    }
 
     // MARK: - Commands
 
@@ -574,40 +583,92 @@ public final class PlayerCore: NSObject {
     /// `wrapper` internal to the pod, so `addBoundaryTimeObserver` is not reachable from here
     /// without forking the pod; a 100 ms poll while armed is the next best thing and is only ever
     /// scheduled while something is actually armed.
+    ///
+    /// The poll compares ``position``, which reports a seek's target until the seek lands, and waits
+    /// while one is landing: `player.currentTime` is still the *old* place then, so a stop armed
+    /// right after a seek back to an earlier sentence read as already passed and paused at once.
+    /// The stop belongs to the item it was armed on. One that sat within a poll of that item's end
+    /// is honoured in ``itemDidPlayToEndTime(_:)`` instead, rather than pausing the next item at
+    /// the same offset or letting it play on.
     public func setStopAt(_ position: Double) {
         clearStopAt()
         guard position.isFinite else { return }
-        stopAtTarget = position
-        let timer = Timer(timeInterval: 0.1, repeats: true) { [weak self] _ in
-            self?.checkStopAt()
+        let itemURL = player.currentItem.flatMap(Self.sourceURL(of:))
+        stopAtLock.lock()
+        stopAtTarget = (position, itemURL)
+        stopAtLock.unlock()
+        onMain { [weak self] in
+            guard let self = self else { return }
+            self.stopAtTimer?.invalidate()
+            let timer = Timer(timeInterval: 0.1, repeats: true) { [weak self] _ in
+                self?.checkStopAt()
+            }
+            RunLoop.main.add(timer, forMode: .common)
+            self.stopAtTimer = timer
         }
-        RunLoop.main.add(timer, forMode: .common)
-        stopAtTimer = timer
     }
 
     /// Disarm a pending ``setStopAt(_:)``. A no-op when nothing is armed.
     public func clearStopAt() {
-        stopAtTimer?.invalidate()
-        stopAtTimer = nil
+        stopAtLock.lock()
         stopAtTarget = nil
+        stopAtLock.unlock()
+        onMain { [weak self] in
+            self?.stopAtTimer?.invalidate()
+            self?.stopAtTimer = nil
+        }
+    }
+
+    /// The armed stop, disarmed in the same step: whoever takes it is the one that honours it.
+    private func takeStopAt() -> (position: Double, itemURL: URL?)? {
+        stopAtLock.lock()
+        defer { stopAtLock.unlock() }
+        let armed = stopAtTarget
+        stopAtTarget = nil
+        return armed
     }
 
     private func checkStopAt() {
-        guard let target = stopAtTarget else {
+        stopAtLock.lock()
+        let armed = stopAtTarget
+        stopAtLock.unlock()
+        guard let armed = armed else {
             clearStopAt()
             return
         }
-        let now = player.currentTime
-        guard now.isFinite, now >= target - 0.05 else { return }
+        // Another item: the armed one ended and the queue moved on, which the item-end handler
+        // has already answered — or it was replaced, which disarms the stop anyway.
+        if armed.itemURL != player.currentItem.flatMap(Self.sourceURL(of:)) {
+            clearStopAt()
+            return
+        }
+        // A seek or a load still landing: `position` is its target, not where the voice is.
+        guard pendingPosition == nil else { return }
+        let now = position
+        guard now >= armed.position - 0.05, takeStopAt() != nil else { return }
         clearStopAt()
+        honourStopAt(at: now)
+    }
+
+    /// Pause with reason `stop_at` and announce it.
+    private func honourStopAt(at position: Double) {
         transportReason = .stopAt
         player.pause()
         publishSnapshot(reason: .stopAt)
         NotificationCenter.default.post(
             name: PlayerCore.stopAtReached,
             object: self,
-            userInfo: [PlayerCore.positionKey: now]
+            userInfo: [PlayerCore.positionKey: position]
         )
+    }
+
+    /// Runs `work` on main: at once when already there, else queued in call order.
+    private func onMain(_ work: @escaping () -> Void) {
+        if Thread.isMainThread {
+            work()
+        } else {
+            DispatchQueue.main.async(execute: work)
+        }
     }
 
     // MARK: - End of an item
@@ -624,9 +685,19 @@ public final class PlayerCore: NSObject {
               let ended = queuedItem(of: url)
         else { return }
         let trackId = (ended.item as? Track)?.toObject()["id"] as? String
+        // A stop armed on this item that the poll had not reached yet (it sat within a poll of the
+        // end): the item's end is where it stops, and the next item must not play.
+        stopAtLock.lock()
+        let stopOnThisItem = stopAtTarget.map { $0.itemURL == url.standardized } ?? false
+        stopAtLock.unlock()
+        if stopOnThisItem, let armed = takeStopAt() {
+            clearStopAt()
+            player.playWhenReady = false
+            honourStopAt(at: armed.position)
+        }
         // Android arms media3's pause only while a next item exists: the last item's end stays the
         // queue's end on both platforms.
-        let paused = pauseAtEndOfItem && ended.hasNext
+        let paused = !stopOnThisItem && pauseAtEndOfItem && ended.hasNext
         if paused {
             player.playWhenReady = false
             publishSnapshot(reason: .system)
