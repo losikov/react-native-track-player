@@ -79,6 +79,35 @@ public enum TransportPolicy {
     case applyNativelyAndNotify
 }
 
+/// App code that decides where playback starts. The engine holds no rule of its own about it: before
+/// every start of playback it asks, passes what it knows, and plays from the answer. Registered once
+/// per process on ``PlayerCore/startPositionAdvisor``; with none registered every start plays from
+/// where it is, as it always did. The Android twin is `StartPositionAdvisor` in `MusicService.kt`.
+///
+/// Asked on two occasions, on the thread the command runs on:
+/// - a play after a pause, from any source — the app, the lock screen, CarPlay, a headphone remote —
+///   with `restore` false. It must answer from memory: the remote handler is waiting.
+/// - a `loadQueue`, `skip` or `seekTo` whose caller said its position is a restored one (`restore: true`).
+///   Here it may take a few milliseconds to read what it needs.
+@objc public protocol PlayerStartPositionAdvisor: AnyObject {
+    /// - Parameters:
+    ///   - trackId: the `id` of the queue item about to play.
+    ///   - position: where it would start, in seconds.
+    ///   - pausedForSec: how long playback has been paused, or a negative number when this start
+    ///     does not follow a pause (a load, a skip, the first play after either).
+    ///   - seekedDuringPause: a seek, skip, load or stop happened since that pause began.
+    ///   - restore: the command said its position was restored from storage.
+    /// - Returns: the position to start from; `position` to leave it where it is.
+    @objc(startPositionForTrack:position:pausedForSec:seekedDuringPause:restore:)
+    func startPosition(
+        forTrack trackId: String,
+        position: Double,
+        pausedForSec: Double,
+        seekedDuringPause: Bool,
+        restore: Bool
+    ) -> Double
+}
+
 public struct PlaybackErrorInfo: Equatable {
     public let code: String
     public let message: String
@@ -123,6 +152,9 @@ public struct PlayerSnapshot: Equatable {
     public var volume: Float = 1
     /// Sticky until the next load or a play-after-error.
     public var error: PlaybackErrorInfo?
+    /// How far back the ``PlayerStartPositionAdvisor`` moved the start of the playback in progress,
+    /// in seconds; 0 when it did not. Cleared by the next pause and by any other move of the playhead.
+    public var snapSec: Double = 0
 
     /// The `onPlaybackState` / `getPlaybackState()` keys, and the `userInfo` an ObjC observer reads.
     /// The legacy `state` string is not in here: `TrackPlayer.swift` adds it, because it is derived
@@ -138,6 +170,9 @@ public struct PlayerSnapshot: Equatable {
         ]
         if let error = error {
             dict["error"] = ["code": error.code, "message": error.message]
+        }
+        if snapSec > 0 {
+            dict["snapSec"] = snapSec
         }
         return dict
     }
@@ -187,6 +222,17 @@ public final class PlayerCore: NSObject {
     /// See ``TransportPolicy``. Lives here rather than on `TrackPlayer` so other native code in the
     /// app (CarPlay, a future sleep timer) reads the same value the remote handlers do.
     public var transportPolicy: TransportPolicy = .applyNativelyAndNotify
+
+    /// See ``PlayerStartPositionAdvisor``. Static so app code can register it before anything touches
+    /// ``shared``.
+    @objc public static var startPositionAdvisor: PlayerStartPositionAdvisor?
+
+    /// When the intent last went from playing to paused; nil once playback starts again.
+    private var pausedAt: Date?
+    /// Whether a seek, skip, load or stop has moved the playhead since ``pausedAt``.
+    private var playheadMovedSincePause = false
+    /// See ``PlayerSnapshot/snapSec``.
+    private var snapSec: Double = 0
 
     private var transportReason: PlaybackTransportReason = .system
     private var suppression: PlaybackSuppression = .none
@@ -374,11 +420,22 @@ public final class PlayerCore: NSObject {
     /// the item is still loading — `AVPlayerWrapper` holds it as `timeToSeekToAfterLoading` and
     /// applies it the moment the asset is ready — and ``position`` reports the target in the
     /// meantime, so no event can carry a 0 before it.
-    public func loadQueue(items: [AudioItem], startIndex: Int, startPosition: Double, playWhenReady: Bool) throws {
+    ///
+    /// `restore` says `startPosition` was restored from storage rather than chosen by the listener:
+    /// the ``startPositionAdvisor`` is asked for the start before anything loads.
+    public func loadQueue(
+        items: [AudioItem],
+        startIndex: Int,
+        startPosition requestedPosition: Double,
+        playWhenReady: Bool,
+        restore: Bool = false
+    ) throws {
         beginCommand()
         defer { endCommand() }
         clearStopAt()
         pendingPosition = nil
+        var startPosition = requestedPosition
+        var restoreSnap = 0.0
         player.playWhenReady = false
         player.stop()
         player.clear()
@@ -389,6 +446,10 @@ public final class PlayerCore: NSObject {
         player.add(items: items, playWhenReady: false)
 
         let index = max(0, min(startIndex, items.count - 1))
+        if restore {
+            startPosition = adviseRestore(item: items[index], position: requestedPosition)
+            restoreSnap = max(0, requestedPosition - startPosition)
+        }
         // Armed before the seek, not after: `AVPlayerWrapper.seek` defers to
         // `timeToSeekToAfterLoading` while the item is still loading and only calls back once the
         // real seek has run, and that callback is what disarms it again.
@@ -399,6 +460,12 @@ public final class PlayerCore: NSObject {
         }
         player.playWhenReady = playWhenReady
 
+        // Published once first, so a load that stops playback is timed as a pause like any other,
+        // and only then marked: the pause it starts is one a load already moved, and the snap is
+        // this load's.
+        publishSnapshot(reason: .user)
+        playheadMovedSincePause = true
+        snapSec = restoreSnap
         publishSnapshot(reason: .user)
         postProgressJump(position: startPosition > 0 ? startPosition : 0)
     }
@@ -410,6 +477,7 @@ public final class PlayerCore: NSObject {
         if player.playerState == .failed {
             player.reload(startFromCurrentTime: true)
         }
+        adviseStart()
         player.play()
         publishSnapshot(reason: reason)
     }
@@ -429,16 +497,28 @@ public final class PlayerCore: NSObject {
         clearStopAt()
         pendingPosition = nil
         player.stop()
+        // After the publish, which times a stop of playback as a pause: the pause a stop starts is moved.
         publishSnapshot(reason: reason)
+        notePlayheadMoved()
     }
 
     public func setPlayWhenReady(_ playWhenReady: Bool, reason: PlaybackTransportReason = .user) {
+        if playWhenReady {
+            adviseStart()
+        }
         player.playWhenReady = playWhenReady
         publishSnapshot(reason: reason)
     }
 
-    public func seek(to position: Double, reason: PlaybackTransportReason = .user) {
+    /// `restore` says `position` was restored from storage: see ``loadQueue(items:startIndex:startPosition:playWhenReady:restore:)``.
+    public func seek(to requested: Double, reason: PlaybackTransportReason = .user, restore: Bool = false) {
         clearStopAt()
+        notePlayheadMoved()
+        var position = requested
+        if restore, requested > 0, let item = player.currentItem {
+            position = adviseRestore(item: item, position: requested)
+            snapSec = max(0, requested - position)
+        }
         pendingPosition = position
         player.seek(to: position)
         publishSnapshot(reason: reason)
@@ -449,20 +529,28 @@ public final class PlayerCore: NSObject {
         // An absolute seek from the position already reported, so the mask and the seek always agree
         // and quick jumps add up the way ExoPlayer's masked `seekBy` does. `AVPlayerWrapper.seek(by:)`
         // reads the item's own clock instead, which is 0 while a replaced item is still loading.
+        notePlayheadMoved()
         let target = max(0, position + offset)
         pendingPosition = target
         player.seek(to: target)
         publishSnapshot(reason: reason)
     }
 
-    public func skip(to index: Int, position: Double? = nil) throws {
+    /// `restore` says `position` was restored from storage: see ``loadQueue(items:startIndex:startPosition:playWhenReady:restore:)``.
+    public func skip(to index: Int, position: Double? = nil, restore: Bool = false) throws {
         beginCommand()
         defer { endCommand() }
         clearStopAt()
+        notePlayheadMoved()
         // Armed before the jump, and only when a seek will actually follow: `jumpToItem` answers
         // "already on this index" with `seek(to: 0)`, and the position below is the one that must
         // win. Nothing arms it when no seek is issued, because `event.seek` is what disarms it.
-        let target = (position ?? -1) >= 0 ? position : nil
+        var target = (position ?? -1) >= 0 ? position : nil
+        if restore, let requested = target, requested > 0, player.items.indices.contains(index) {
+            let advised = adviseRestore(item: player.items[index], position: requested)
+            snapSec = max(0, requested - advised)
+            target = advised
+        }
         pendingPosition = target
         try player.jumpToItem(atIndex: index, playWhenReady: player.playWhenReady)
         if let target = target {
@@ -473,6 +561,7 @@ public final class PlayerCore: NSObject {
 
     public func next() {
         clearStopAt()
+        notePlayheadMoved()
         pendingPosition = nil
         player.next()
         publishSnapshot()
@@ -480,6 +569,7 @@ public final class PlayerCore: NSObject {
 
     public func previous() {
         clearStopAt()
+        notePlayheadMoved()
         pendingPosition = nil
         player.previous()
         publishSnapshot()
@@ -491,6 +581,53 @@ public final class PlayerCore: NSObject {
         player.rate = rate
         publishSnapshot()
         reportDefaultRate()
+    }
+
+    // MARK: - Start position
+
+    /// Ask the ``startPositionAdvisor`` where a play that is about to start should begin, and seek
+    /// there first. A no-op while playback is already meant to be running, so the `setPlayWhenReady`
+    /// + `play` pair JS sends asks once.
+    private func adviseStart() {
+        guard !player.playWhenReady else { return }
+        let pausedFor = pausedAt.map { max(0, Date().timeIntervalSince($0)) }
+        let moved = playheadMovedSincePause
+        pausedAt = nil
+        playheadMovedSincePause = false
+        guard let advisor = Self.startPositionAdvisor, let trackId = activeTrackId else { return }
+        let current = position
+        let target = advisor.startPosition(
+            forTrack: trackId,
+            position: current,
+            pausedForSec: pausedFor ?? -1,
+            seekedDuringPause: moved,
+            restore: false
+        )
+        guard target.isFinite, target >= 0, abs(target - current) > 0.001 else { return }
+        NSLog("RNTP-Transport: start moved by the advisor: \(current) -> \(target)")
+        snapSec = max(0, current - target)
+        pendingPosition = target
+        player.seek(to: target)
+    }
+
+    /// The ``startPositionAdvisor``'s start for `item` restored at `position`, or `position`.
+    private func adviseRestore(item: AudioItem, position: Double) -> Double {
+        guard let advisor = Self.startPositionAdvisor,
+              let trackId = (item as? Track)?.toObject()["id"] as? String
+        else { return position }
+        let target = advisor.startPosition(
+            forTrack: trackId,
+            position: position,
+            pausedForSec: -1,
+            seekedDuringPause: false,
+            restore: true
+        )
+        return target.isFinite && target >= 0 ? target : position
+    }
+
+    private func notePlayheadMoved() {
+        playheadMovedSincePause = true
+        snapSec = 0
     }
 
     // MARK: - Remote playback rate
@@ -782,6 +919,15 @@ public final class PlayerCore: NSObject {
             transport = .paused
         }
 
+        // A pause is timed from here, whatever asked for it: the app, a remote, a stopAt, an end of item.
+        if snapshot.transport == .playing, transport == .paused {
+            pausedAt = Date()
+            playheadMovedSincePause = false
+            snapSec = 0
+        } else if transport == .playing {
+            pausedAt = nil
+        }
+
         let index = player.currentIndex
         var next = PlayerSnapshot()
         next.transport = transport
@@ -798,6 +944,7 @@ public final class PlayerCore: NSObject {
         next.rate = player.rate
         next.volume = player.volume
         next.error = error
+        next.snapSec = snapSec
 
         if next != snapshot {
             snapshot = next

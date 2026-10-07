@@ -100,10 +100,11 @@ class QueuedAudioPlayer(
         startIndex: Int,
         startPositionMs: Long,
         playWhenReady: Boolean,
+        restore: Boolean,
     ) {
         queue.clear()
         queue.addAll(items.map { mediaItemOf(it) })
-        super.loadQueue(items, startIndex, startPositionMs, playWhenReady)
+        super.loadQueue(items, startIndex, startPositionMs, playWhenReady, restore)
     }
 
     /**
@@ -188,6 +189,7 @@ class QueuedAudioPlayer(
      */
     fun next() {
         clearStopAt()
+        notePlayheadMoved()
         exoPlayer.seekToNextMediaItem()
         exoPlayer.prepare()
     }
@@ -198,6 +200,7 @@ class QueuedAudioPlayer(
      */
     fun previous() {
         clearStopAt()
+        notePlayheadMoved()
         exoPlayer.seekToPreviousMediaItem()
         exoPlayer.prepare()
     }
@@ -228,11 +231,18 @@ class QueuedAudioPlayer(
      * Jump to an item in the queue.
      * @param index the index to jump to
      * @param positionMs position within the item in milliseconds, or [C.TIME_UNSET] to start at the beginning
+     * @param restore [positionMs] was restored from storage: the [startAdvisor] is asked where to start
      */
-    fun jumpToItem(index: Int, positionMs: Long = C.TIME_UNSET) {
+    fun jumpToItem(index: Int, positionMs: Long = C.TIME_UNSET, restore: Boolean = false) {
         clearStopAt()
+        notePlayheadMoved()
+        var start = positionMs
+        if (restore && positionMs > 0) {
+            items.getOrNull(index)?.let { start = adviseRestore(it, positionMs) }
+            noteRestoreSnap(positionMs, start)
+        }
         try {
-            exoPlayer.seekTo(index, positionMs)
+            exoPlayer.seekTo(index, start)
             exoPlayer.prepare()
         } catch (e: IllegalSeekPositionException) {
             throw Error("This item index $index does not exist. The size of the queue is ${queue.size} items.")

@@ -67,7 +67,46 @@ data class PlayerSnapshot(
     val repeatMode: RepeatMode = RepeatMode.OFF,
     /** Sticky until the next load or a play-after-error. */
     val error: PlaybackError? = null,
+    /**
+     * How far back the [PlaybackStartAdvisor] moved the start of the playback in progress, in seconds;
+     * 0 when it did not. Cleared by the next pause and by any other move of the playhead.
+     */
+    val snapSec: Double = 0.0,
 )
+
+/**
+ * App code that decides where playback starts, as the engine sees it: about a queue item, in
+ * milliseconds. The engine holds no rule of its own: before every start of playback it asks, passes
+ * what it knows, and plays from the answer. `MusicService` adapts the app's `StartPositionAdvisor` to
+ * this; with none, every start plays from where it is. The iOS twin is `PlayerStartPositionAdvisor`.
+ *
+ * Asked on Main, on two occasions: a play after a pause, from any source, with `restore` false — it
+ * must answer from memory — and a load, skip or seek whose caller said its position was restored from
+ * storage, where it may take a few milliseconds to read what it needs.
+ */
+interface PlaybackStartAdvisor {
+    /**
+     * @param pausedForMs how long playback has been paused, or null when this start does not follow a
+     *   pause (a load, a skip, the first play after either).
+     * @param seekedDuringPause a seek, skip, load or stop happened since that pause began.
+     * @param restore the command said its position was restored from storage.
+     * @return the position to start from; [positionMs] to leave it where it is.
+     */
+    fun startPositionMs(
+        item: AudioItem,
+        positionMs: Long,
+        pausedForMs: Long?,
+        seekedDuringPause: Boolean,
+        restore: Boolean,
+    ): Long
+
+    /**
+     * How long a transient audio-focus loss (a phone call) may hold playback back before the engine
+     * turns it into a real pause, timed from when the hold began. Null keeps today's behaviour: the
+     * hold lasts as long as the loss, and playback resumes by itself when it ends.
+     */
+    fun holdBecomesPauseAfterMs(): Long?
+}
 
 /**
  * What [com.doublesymmetry.kotlinaudio.players.InterceptingPlayer] does with a transport command

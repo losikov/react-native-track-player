@@ -433,12 +433,12 @@ RCT_EXPORT_MODULE()
     [_trackPlayer seekBy:offset resolver:resolve rejecter:reject];
 }
 
-- (void)seekTo:(double)position resolve:(nonnull RCTPromiseResolveBlock)resolve reject:(nonnull RCTPromiseRejectBlock)reject {
-    [_trackPlayer seekTo:position resolver:resolve rejecter:reject];
+- (void)seekTo:(double)position restore:(BOOL)restore resolve:(nonnull RCTPromiseResolveBlock)resolve reject:(nonnull RCTPromiseRejectBlock)reject {
+    [_trackPlayer seekTo:position restore:restore resolver:resolve rejecter:reject];
 }
 
-- (void)loadQueue:(nonnull NSArray *)tracks startIndex:(NSInteger)startIndex startPositionSec:(double)startPositionSec playWhenReady:(BOOL)playWhenReady resolve:(nonnull RCTPromiseResolveBlock)resolve reject:(nonnull RCTPromiseRejectBlock)reject {
-    [_trackPlayer loadQueue:tracks startIndex:@(startIndex) startPositionSec:startPositionSec playWhenReady:playWhenReady resolver:resolve rejecter:reject];
+- (void)loadQueue:(nonnull NSArray *)tracks startIndex:(NSInteger)startIndex startPositionSec:(double)startPositionSec playWhenReady:(BOOL)playWhenReady restore:(BOOL)restore resolve:(nonnull RCTPromiseResolveBlock)resolve reject:(nonnull RCTPromiseRejectBlock)reject {
+    [_trackPlayer loadQueue:tracks startIndex:@(startIndex) startPositionSec:startPositionSec playWhenReady:playWhenReady restore:restore resolver:resolve rejecter:reject];
 }
 
 - (void)setStopAt:(double)positionSec resolve:(nonnull RCTPromiseResolveBlock)resolve reject:(nonnull RCTPromiseRejectBlock)reject {
@@ -482,9 +482,9 @@ RCT_EXPORT_MODULE()
     [_trackPlayer setupPlayer:config resolver:resolve rejecter:reject];
 }
 
-- (void)skip:(NSInteger)index initialPosition:(nonnull NSNumber *)initialPosition resolve:(nonnull RCTPromiseResolveBlock)resolve reject:(nonnull RCTPromiseRejectBlock)reject {
-    NSLog(@"RTNTrackPlayer: skip called with index: %ld, initialPosition: %@", (long)index, initialPosition);
-    [_trackPlayer skip:@(index) initialTime:[initialPosition doubleValue] resolver:resolve rejecter:reject];
+- (void)skip:(NSInteger)index initialPosition:(double)initialPosition restore:(BOOL)restore resolve:(nonnull RCTPromiseResolveBlock)resolve reject:(nonnull RCTPromiseRejectBlock)reject {
+    NSLog(@"RTNTrackPlayer: skip called with index: %ld, initialPosition: %f, restore: %d", (long)index, initialPosition, restore);
+    [_trackPlayer skip:@(index) initialTime:initialPosition restore:restore resolver:resolve rejecter:reject];
 }
 
 - (void)skipToNext:(nonnull RCTPromiseResolveBlock)resolve reject:(nonnull RCTPromiseRejectBlock)reject {
@@ -499,7 +499,7 @@ RCT_EXPORT_MODULE()
 
 - (void)skipToTrack:(NSInteger)index resolve:(nonnull RCTPromiseResolveBlock)resolve reject:(nonnull RCTPromiseRejectBlock)reject {
     NSLog(@"RTNTrackPlayer: skipToTrack called with index: %ld", (long)index);
-    [_trackPlayer skip:@(index) initialTime:0.0 resolver:resolve rejecter:reject];
+    [_trackPlayer skip:@(index) initialTime:0.0 restore:NO resolver:resolve rejecter:reject];
 }
 
 - (void)stop:(nonnull RCTPromiseResolveBlock)resolve reject:(nonnull RCTPromiseRejectBlock)reject {

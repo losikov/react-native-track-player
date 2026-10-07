@@ -603,10 +603,11 @@ public class TrackPlayer: NSObject, AudioSessionControllerDelegate {
         resolve(NSNull())
     }
 
-    @objc(skip:initialTime:resolver:rejecter:)
+    @objc(skip:initialTime:restore:resolver:rejecter:)
     public func skip(
         to trackIndex: NSNumber,
         initialTime: Double,
+        restore: Bool,
         resolve: RCTPromiseResolveBlock,
         reject: RCTPromiseRejectBlock
     ) {
@@ -618,7 +619,7 @@ public class TrackPlayer: NSObject, AudioSessionControllerDelegate {
         print("Skipping to track:", index)
         // One call, so the snapshot carries the target position from the start: the old
         // jump-then-seek pair let a progress tick report 0 in between.
-        try? core.skip(to: index, position: initialTime >= 0 ? initialTime : nil)
+        try? core.skip(to: index, position: initialTime >= 0 ? initialTime : nil, restore: restore)
         resolve(NSNull())
     }
 
@@ -634,7 +635,7 @@ public class TrackPlayer: NSObject, AudioSessionControllerDelegate {
 
         // if an initialTime is passed the seek to it
         if (initialTime >= 0) {
-            self.seekTo(time: initialTime, resolve: resolve, reject: reject)
+            self.seekTo(time: initialTime, restore: false, resolve: resolve, reject: reject)
         } else {
             resolve(NSNull())
         }
@@ -652,7 +653,7 @@ public class TrackPlayer: NSObject, AudioSessionControllerDelegate {
 
         // if an initialTime is passed the seek to it
         if (initialTime >= 0) {
-            self.seekTo(time: initialTime, resolve: resolve, reject: reject)
+            self.seekTo(time: initialTime, restore: false, resolve: resolve, reject: reject)
         } else {
             resolve(NSNull())
         }
@@ -704,11 +705,11 @@ public class TrackPlayer: NSObject, AudioSessionControllerDelegate {
         resolve(NSNull())
     }
 
-    @objc(seekTo:resolver:rejecter:)
-    public func seekTo(time: Double, resolve: RCTPromiseResolveBlock, reject: RCTPromiseRejectBlock) {
+    @objc(seekTo:restore:resolver:rejecter:)
+    public func seekTo(time: Double, restore: Bool, resolve: RCTPromiseResolveBlock, reject: RCTPromiseRejectBlock) {
         if (rejectWhenNotInitialized(reject: reject)) { return }
 
-        core.seek(to: time)
+        core.seek(to: time, restore: restore)
         resolve(NSNull())
     }
 
@@ -721,12 +722,13 @@ public class TrackPlayer: NSObject, AudioSessionControllerDelegate {
     }
 
     /// Replace the queue, the index and the position in one call. See `PlayerCore.loadQueue`.
-    @objc(loadQueue:startIndex:startPositionSec:playWhenReady:resolver:rejecter:)
+    @objc(loadQueue:startIndex:startPositionSec:playWhenReady:restore:resolver:rejecter:)
     public func loadQueue(
         trackDicts: [[String: Any]],
         startIndex: NSNumber,
         startPositionSec: Double,
         playWhenReady: Bool,
+        restore: Bool,
         resolve: RCTPromiseResolveBlock,
         reject: RCTPromiseRejectBlock
     ) {
@@ -757,7 +759,8 @@ public class TrackPlayer: NSObject, AudioSessionControllerDelegate {
                 items: tracks,
                 startIndex: index,
                 startPosition: startPositionSec,
-                playWhenReady: playWhenReady
+                playWhenReady: playWhenReady,
+                restore: restore
             )
         } catch {
             reject("runtime_exception", error.localizedDescription, error)

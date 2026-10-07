@@ -682,12 +682,12 @@ class TrackPlayerModule(
         }
     }
 
-    override fun seekTo(position: Double, promise: Promise) {
-        Timber.d("🎵 TurboModule seekTo() called with position: $position")
+    override fun seekTo(position: Double, restore: Boolean, promise: Promise) {
+        Timber.d("🎵 TurboModule seekTo() called with position: $position, restore: $restore")
         scope.launch {
             if (verifyServiceBoundOrReject(promise)) return@launch
             try {
-                musicService.seekTo(position.toFloat())
+                musicService.seekTo(position.toFloat(), restore)
                 promise.resolve(null)
             } catch (exception: Exception) {
                 promise.reject("runtime_exception", exception.message, exception)
@@ -708,6 +708,7 @@ class TrackPlayerModule(
         startIndex: Double,
         startPositionSec: Double,
         playWhenReady: Boolean,
+        restore: Boolean,
         promise: Promise
     ) {
         Timber.d("🎵 TurboModule loadQueue() called with ${tracks.size()} tracks, startIndex: $startIndex, startPositionSec: $startPositionSec, playWhenReady: $playWhenReady")
@@ -724,7 +725,7 @@ class TrackPlayerModule(
                     promise.reject("index_out_of_bounds", "The track index is out of bounds")
                     return@launch
                 }
-                musicService.loadQueue(trackList, index, startPositionSec, playWhenReady)
+                musicService.loadQueue(trackList, index, startPositionSec, playWhenReady, restore)
                 promise.resolve(null)
             } catch (exception: Exception) {
                 promise.reject("runtime_exception", exception.message, exception)
@@ -955,14 +956,13 @@ class TrackPlayerModule(
         }
     }
 
-    override fun skip(index: Double, initialPosition: Double?, promise: Promise) {
-        Timber.d("🎵 TurboModule skip() called with index: $index, initialPosition: $initialPosition")
+    override fun skip(index: Double, initialPosition: Double, restore: Boolean, promise: Promise) {
+        Timber.d("🎵 TurboModule skip() called with index: $index, initialPosition: $initialPosition, restore: $restore")
         scope.launch {
             if (verifyServiceBoundOrReject(promise)) return@launch
             try {
-                val initialPositionSeconds =
-                    if (initialPosition != null && initialPosition >= 0) initialPosition.toFloat() else null
-                musicService.skip(index.toInt(), initialPositionSeconds)
+                val initialPositionSeconds = if (initialPosition >= 0) initialPosition.toFloat() else null
+                musicService.skip(index.toInt(), initialPositionSeconds, restore)
                 promise.resolve(null)
             } catch (exception: Exception) {
                 promise.reject("runtime_exception", exception.message, exception)
@@ -1334,6 +1334,7 @@ class TrackPlayerModule(
                 data.getString("readiness")?.let { putString("readiness", it) }
                 data.getString("reason")?.let { putString("reason", it) }
                 data.getString("suppression")?.let { putString("suppression", it) }
+                if (data.containsKey("snapSec")) putDouble("snapSec", data.getDouble("snapSec"))
             }
             emitOnPlaybackState(stateObj)
         }

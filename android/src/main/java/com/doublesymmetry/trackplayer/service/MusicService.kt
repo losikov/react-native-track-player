@@ -113,6 +113,44 @@ fun interface RemoteRateObserver {
 }
 
 /**
+ * Native code in the app that decides where playback starts. The engine holds no rule of its own:
+ * before every start of playback it asks, passes what it knows, and plays from the answer. Registered
+ * once per process on [MusicService.startPositionAdvisor]; with none, every start plays from where it
+ * is, as it always did. The iOS twin is `PlayerStartPositionAdvisor` in `PlayerCore.swift`.
+ *
+ * Asked on Main, on two occasions: a play after a pause, from any source — the app, the notification,
+ * Bluetooth, Android Auto — with `restore` false, which must answer from memory; and a `loadQueue`,
+ * `skip` or `seekTo` whose caller said its position was restored from storage (`restore: true`), which
+ * may take a few milliseconds to read what it needs.
+ */
+interface StartPositionAdvisor {
+    /**
+     * @param trackId the `id` of the queue item about to play.
+     * @param positionSec where it would start.
+     * @param pausedForSec how long playback has been paused, or null when this start does not follow a
+     *   pause (a load, a skip, the first play after either).
+     * @param seekedDuringPause a seek, skip, load or stop happened since that pause began.
+     * @param restore the command said its position was restored from storage.
+     * @return the position to start from; [positionSec] to leave it where it is.
+     */
+    fun startPosition(
+        trackId: String,
+        positionSec: Double,
+        pausedForSec: Double?,
+        seekedDuringPause: Boolean,
+        restore: Boolean,
+    ): Double
+
+    /**
+     * How long a transient audio-focus loss (a phone call) may hold playback back before the engine
+     * turns it into a real pause, timed from when the hold began. Null keeps today's behaviour: the
+     * hold lasts as long as the loss, and playback resumes by itself when it ends.
+     */
+    val holdBecomesPauseAfterSec: Double?
+        get() = null
+}
+
+/**
  * Native code in the app that needs to know a queue item played to its end by itself — never a skip,
  * a seek or a load. Called on Main, once per end, with the [trackId] of the item that ended (null
  * when it has none) and [pausedAtEnd], true when [MusicService.setPauseAtEndOfItem] stopped playback
@@ -335,10 +373,36 @@ class MusicService : HeadlessJsMediaService() {
         )
         created.automaticallyUpdateNotificationMetadata =
             options?.getBoolean(AUTO_UPDATE_METADATA, true) ?: true
+        created.startAdvisor = engineStartAdvisor
         engine = created
         created.setPauseAtEndOfItem(pauseAtEndOfItem)
         observeEvents()
         return created
+    }
+
+    /** The app's [startPositionAdvisor], spoken to in the engine's terms: queue items and milliseconds. */
+    private val engineStartAdvisor = object : PlaybackStartAdvisor {
+        override fun startPositionMs(
+            item: AudioItem,
+            positionMs: Long,
+            pausedForMs: Long?,
+            seekedDuringPause: Boolean,
+            restore: Boolean,
+        ): Long {
+            val advisor = startPositionAdvisor ?: return positionMs
+            val trackId = (item as? TrackAudioItem)?.track?.originalItem?.getString("id") ?: return positionMs
+            val answer = advisor.startPosition(
+                trackId,
+                positionMs / 1000.0,
+                pausedForMs?.let { it / 1000.0 },
+                seekedDuringPause,
+                restore,
+            )
+            return if (answer.isFinite() && answer >= 0) Math.round(answer * 1000) else positionMs
+        }
+
+        override fun holdBecomesPauseAfterMs(): Long? =
+            startPositionAdvisor?.holdBecomesPauseAfterSec?.takeIf { it.isFinite() && it >= 0 }?.let { Math.round(it * 1000) }
     }
 
     private fun playerConfigFrom(playerOptions: Bundle?) = PlayerConfig(
@@ -1224,11 +1288,12 @@ class MusicService : HeadlessJsMediaService() {
         startIndex: Int,
         startPositionSeconds: Double,
         playWhenReady: Boolean,
+        restore: Boolean = false,
     ) {
         val positionMs =
             if (startPositionSeconds > 0) (startPositionSeconds * 1000).toLong()
             else androidx.media3.common.C.TIME_UNSET
-        player.loadQueue(tracks.map { it.toAudioItem() }, startIndex, positionMs, playWhenReady)
+        player.loadQueue(tracks.map { it.toAudioItem() }, startIndex, positionMs, playWhenReady, restore)
     }
 
     @MainThread
@@ -1311,7 +1376,7 @@ class MusicService : HeadlessJsMediaService() {
     }
 
     @MainThread
-    fun skip(index: Int, initialPositionSeconds: Float? = null) {
+    fun skip(index: Int, initialPositionSeconds: Float? = null, restore: Boolean = false) {
         val positionMs =
             if (initialPositionSeconds != null && initialPositionSeconds > 0f) {
                 (initialPositionSeconds * 1000).toLong()
@@ -1320,7 +1385,7 @@ class MusicService : HeadlessJsMediaService() {
             }
         // Single seekTo(index, positionMs) — do not seek again after jumpToItem; ExoPlayer drops
         // a follow-up seek when prepare() is still running (iOS seekTo-after-jump works synchronously).
-        player.jumpToItem(index, positionMs)
+        player.jumpToItem(index, positionMs, restore)
     }
 
     @MainThread
@@ -1334,8 +1399,8 @@ class MusicService : HeadlessJsMediaService() {
     }
 
     @MainThread
-    fun seekTo(seconds: Float) {
-        player.seek((seconds * 1000).toLong(), TimeUnit.MILLISECONDS)
+    fun seekTo(seconds: Float, restore: Boolean = false) {
+        player.seek((seconds * 1000).toLong(), TimeUnit.MILLISECONDS, restore = restore)
     }
 
     @MainThread
@@ -1500,6 +1565,7 @@ class MusicService : HeadlessJsMediaService() {
             bundle.putString("readiness", snapshot.readiness.name.lowercase(Locale.US))
             bundle.putString("reason", snapshot.transportReason.name.lowercase(Locale.US))
             bundle.putString("suppression", snapshot.suppression.name.lowercase(Locale.US))
+            if (snapshot.snapSec > 0) bundle.putDouble("snapSec", snapshot.snapSec)
         }
         return bundle
     }
@@ -1823,6 +1889,14 @@ class MusicService : HeadlessJsMediaService() {
         fun removeAudibilityObserver(observer: AudibilityObserver) {
             audibilityObservers.remove(observer)
         }
+
+        /**
+         * See [StartPositionAdvisor]. Static for the same reason as the observers: the app registers
+         * once per process, before any service exists.
+         */
+        @Volatile
+        @JvmStatic
+        var startPositionAdvisor: StartPositionAdvisor? = null
 
         /**
          * `LegacyConversions.convertToLegacyErrorCode` run backwards.

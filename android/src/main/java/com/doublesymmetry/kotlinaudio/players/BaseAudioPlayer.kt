@@ -2,7 +2,9 @@ package com.doublesymmetry.kotlinaudio.players
 
 import android.content.Context
 import android.net.Uri
+import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import androidx.annotation.CallSuper
 import androidx.media3.common.AudioAttributes
 import androidx.media3.common.C
@@ -36,6 +38,7 @@ import com.doublesymmetry.kotlinaudio.models.BufferConfig
 import com.doublesymmetry.kotlinaudio.models.CacheConfig
 import com.doublesymmetry.kotlinaudio.models.DefaultPlayerOptions
 import com.doublesymmetry.kotlinaudio.models.PlayWhenReadyChangeData
+import com.doublesymmetry.kotlinaudio.models.PlaybackStartAdvisor
 import com.doublesymmetry.kotlinaudio.models.PlaybackError
 import com.doublesymmetry.kotlinaudio.models.PlayerConfig
 import com.doublesymmetry.kotlinaudio.models.PlayerOptions
@@ -109,6 +112,7 @@ abstract class BaseAudioPlayer internal constructor(
     var playWhenReady: Boolean
         get() = exoPlayer.playWhenReady
         set(value) {
+            if (value) adviseStart()
             exoPlayer.playWhenReady = value
             publishSnapshot(if (value) TransportReason.USER else TransportReason.USER)
         }
@@ -169,6 +173,25 @@ abstract class BaseAudioPlayer internal constructor(
     private var stopAtIndex: Int = C.INDEX_UNSET
 
     private var isReinitializingAudioSession = false
+
+    /** See [PlaybackStartAdvisor]; set by `MusicService`. Null: every start plays from where it is. */
+    var startAdvisor: PlaybackStartAdvisor? = null
+
+    // The fields below are read and written on Main only.
+
+    /** `elapsedRealtime` when the intent last went from playing to paused; null once playback starts. */
+    private var pausedAtMs: Long? = null
+
+    /** Whether a seek, skip, load or stop has moved the playhead since [pausedAtMs]. */
+    private var playheadMovedSincePause = false
+
+    /** See [PlayerSnapshot.snapSec]. */
+    private var snapSec = 0.0
+
+    /** `elapsedRealtime` when the transient focus loss holding playback back began; null when none is. */
+    private var holdStartedAtMs: Long? = null
+    private val holdHandler = Handler(Looper.getMainLooper())
+    private val holdLimitReached = Runnable { holdBecomesPause() }
 
     init {
         if (cacheConfig != null) {
@@ -303,6 +326,14 @@ abstract class BaseAudioPlayer internal constructor(
             exoPlayer.playWhenReady -> Transport.PLAYING
             else -> Transport.PAUSED
         }
+        // A pause is timed from here, whatever asked for it: the app, a remote, a stopAt, a focus loss.
+        if (_state.value.transport == Transport.PLAYING && transport == Transport.PAUSED) {
+            pausedAtMs = SystemClock.elapsedRealtime()
+            playheadMovedSincePause = false
+            snapSec = 0.0
+        } else if (transport == Transport.PLAYING) {
+            pausedAtMs = null
+        }
         _state.value = PlayerSnapshot(
             transport = transport,
             transportReason = transportReason,
@@ -323,6 +354,7 @@ abstract class BaseAudioPlayer internal constructor(
                 else -> RepeatMode.OFF
             },
             error = error,
+            snapSec = snapSec,
         )
     }
 
@@ -362,12 +394,22 @@ abstract class BaseAudioPlayer internal constructor(
         startIndex: Int = 0,
         startPositionMs: Long = C.TIME_UNSET,
         playWhenReady: Boolean = false,
+        restore: Boolean = false,
     ) {
         clearStopAt()
         playbackError = null
-        exoPlayer.setMediaItems(items.map { mediaItemOf(it) }, startIndex, startPositionMs)
+        var start = startPositionMs
+        if (restore && startPositionMs > 0) {
+            items.getOrNull(startIndex)?.let { start = adviseRestore(it, startPositionMs) }
+        }
+        exoPlayer.setMediaItems(items.map { mediaItemOf(it) }, startIndex, start)
         exoPlayer.prepare()
         exoPlayer.playWhenReady = playWhenReady
+        // Published once first, so a load that stops playback is timed as a pause like any other, and
+        // only then marked: the pause it starts is one a load already moved, and the snap is this load's.
+        publishSnapshot(TransportReason.USER)
+        playheadMovedSincePause = true
+        snapSec = if (start != startPositionMs) (startPositionMs - start).coerceAtLeast(0) / 1000.0 else 0.0
         publishSnapshot(TransportReason.USER)
         emitProgressDiscontinuity()
     }
@@ -382,6 +424,7 @@ abstract class BaseAudioPlayer internal constructor(
 
     open fun load(item: AudioItem) {
         clearStopAt()
+        notePlayheadMoved()
         exoPlayer.addMediaItem(mediaItemOf(item))
         exoPlayer.prepare()
     }
@@ -414,6 +457,7 @@ abstract class BaseAudioPlayer internal constructor(
         if (exoPlayer.playerError != null) {
             exoPlayer.prepare()
         }
+        adviseStart()
         exoPlayer.play()
         if (currentItem != null) {
             exoPlayer.prepare()
@@ -540,6 +584,8 @@ abstract class BaseAudioPlayer internal constructor(
         exoPlayer.playWhenReady = false
         exoPlayer.stop()
         publishSnapshot(reason)
+        // After the publish, which times a stop of playback as a pause: the pause a stop starts is moved.
+        notePlayheadMoved()
     }
 
     @CallSuper
@@ -569,6 +615,7 @@ abstract class BaseAudioPlayer internal constructor(
 
     @CallSuper
     open fun destroy() {
+        holdHandler.removeCallbacks(holdLimitReached)
         stop()
         exoPlayer.release()
         cache?.release()
@@ -576,12 +623,24 @@ abstract class BaseAudioPlayer internal constructor(
         mediaFactory.cache = null
     }
 
-    open fun seek(duration: Long, unit: TimeUnit, reason: TransportReason = TransportReason.USER) {
+    /** [restore]: the position was restored from storage, so the [startAdvisor] is asked where to start. */
+    open fun seek(
+        duration: Long,
+        unit: TimeUnit,
+        reason: TransportReason = TransportReason.USER,
+        restore: Boolean = false,
+    ) {
         transportReason = reason
         // Disarmed *before* the seek, not after: ExoPlayer delivers a pending message whose
         // position a seek jumps over, so a clear that ran afterwards would arrive too late.
         clearStopAt()
-        val positionMs = TimeUnit.MILLISECONDS.convert(duration, unit)
+        notePlayheadMoved()
+        val requestedMs = TimeUnit.MILLISECONDS.convert(duration, unit)
+        var positionMs = requestedMs
+        if (restore && requestedMs > 0) {
+            currentItem?.let { positionMs = adviseRestore(it, requestedMs) }
+            noteRestoreSnap(requestedMs, positionMs)
+        }
         exoPlayer.seekTo(positionMs)
         publishSnapshot(reason)
     }
@@ -589,6 +648,7 @@ abstract class BaseAudioPlayer internal constructor(
     open fun seekBy(offset: Long, unit: TimeUnit, reason: TransportReason = TransportReason.USER) {
         transportReason = reason
         clearStopAt()
+        notePlayheadMoved()
         val positionMs = exoPlayer.currentPosition + TimeUnit.MILLISECONDS.convert(offset, unit)
         exoPlayer.seekTo(positionMs)
         publishSnapshot(reason)
@@ -610,6 +670,84 @@ abstract class BaseAudioPlayer internal constructor(
     internal fun emitProgressDiscontinuity() {
         playerEventHolder.updateProgressDiscontinuity()
     }
+
+    // region start position
+
+    /**
+     * Ask the [startAdvisor] where a play that is about to start should begin, and seek there first.
+     * A no-op while playback is already meant to be running, so a `setPlayWhenReady(true)` followed by
+     * a `play()` asks once.
+     */
+    private fun adviseStart() {
+        if (exoPlayer.playWhenReady) return
+        val pausedForMs = pausedAtMs?.let { (SystemClock.elapsedRealtime() - it).coerceAtLeast(0) }
+        val moved = playheadMovedSincePause
+        pausedAtMs = null
+        playheadMovedSincePause = false
+        val advisor = startAdvisor ?: return
+        val item = currentItem ?: return
+        val current = position
+        val target = advisor.startPositionMs(item, current, pausedForMs, moved, restore = false)
+        if (target < 0 || target == current) return
+        Timber.d("start moved by the advisor: %d -> %d", current, target)
+        snapSec = (current - target).coerceAtLeast(0) / 1000.0
+        exoPlayer.seekTo(target)
+    }
+
+    /** The [startAdvisor]'s start for [item] restored at [positionMs], or [positionMs]. */
+    internal fun adviseRestore(
+        item: AudioItem,
+        positionMs: Long,
+    ): Long {
+        val target = startAdvisor?.startPositionMs(item, positionMs, null, false, restore = true) ?: return positionMs
+        return if (target >= 0) target else positionMs
+    }
+
+    /** A seek, skip, load or stop: the next play is not a resume from where a pause left off. */
+    internal fun notePlayheadMoved() {
+        playheadMovedSincePause = true
+        snapSec = 0.0
+    }
+
+    /** Set from [adviseRestore]'s answer by a skip that restored its position. */
+    internal fun noteRestoreSnap(
+        requestedMs: Long,
+        startMs: Long,
+    ) {
+        snapSec = (requestedMs - startMs).coerceAtLeast(0) / 1000.0
+    }
+
+    /**
+     * Start or stop timing a transient focus loss. Past [PlaybackStartAdvisor.holdBecomesPauseAfterMs]
+     * it becomes a real pause, as iOS's interruption handling does for a call over a minute.
+     */
+    private fun updateHold() {
+        val held = exoPlayer.playWhenReady &&
+            exoPlayer.playbackSuppressionReason == Player.PLAYBACK_SUPPRESSION_REASON_TRANSIENT_AUDIO_FOCUS_LOSS
+        if (!held) {
+            holdHandler.removeCallbacks(holdLimitReached)
+            holdStartedAtMs = null
+            return
+        }
+        if (holdStartedAtMs != null) return
+        val limitMs = startAdvisor?.holdBecomesPauseAfterMs() ?: return
+        holdStartedAtMs = SystemClock.elapsedRealtime()
+        holdHandler.postDelayed(holdLimitReached, limitMs)
+    }
+
+    private fun holdBecomesPause() {
+        val started = holdStartedAtMs ?: return
+        holdStartedAtMs = null
+        val stillHeld = exoPlayer.playWhenReady &&
+            exoPlayer.playbackSuppressionReason == Player.PLAYBACK_SUPPRESSION_REASON_TRANSIENT_AUDIO_FOCUS_LOSS
+        if (!stillHeld) return
+        Timber.d("a transient focus loss held playback past the limit: pausing")
+        pause(TransportReason.AUDIO_FOCUS_LOSS)
+        // Timed from when the sound stopped, not from now.
+        pausedAtMs = started
+    }
+
+    // endregion
 
     companion object {
         const val APPLICATION_NAME = MediaFactory.APPLICATION_NAME
@@ -698,6 +836,7 @@ abstract class BaseAudioPlayer internal constructor(
                 if (reason == Player.PLAY_WHEN_READY_CHANGE_REASON_AUDIO_FOCUS_LOSS) {
                     transportReason = TransportReason.AUDIO_FOCUS_LOSS
                 }
+                updateHold()
                 return
             }
             // [setPauseAtEndOfItem]'s pause. The item that ended and the move to the next one are taken
@@ -707,10 +846,12 @@ abstract class BaseAudioPlayer internal constructor(
             if (exoPlayer.hasNextMediaItem()) exoPlayer.seekToNextMediaItem()
             playerEventHolder.updatePlayWhenReadyChange(PlayWhenReadyChangeData(playWhenReady, true, endedItem))
             publishSnapshot(TransportReason.SYSTEM)
+            updateHold()
         }
 
         override fun onPlaybackSuppressionReasonChanged(playbackSuppressionReason: Int) {
             publishSnapshot()
+            updateHold()
         }
 
         /**

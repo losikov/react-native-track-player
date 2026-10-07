@@ -321,6 +321,11 @@ export interface PlaybackStateSnapshot {
   reason?: PlaybackTransportReason;
   /** Playback is intended but held back by the system (a phone call, an unsuitable output). */
   suppression?: PlaybackSuppression;
+  /**
+   * How far back, in seconds, the app's native start-position advisor moved the start of the playback
+   * in progress. Absent when it did not; cleared by the next pause and by any other move of the playhead.
+   */
+  snapSec?: number;
 }
 
 export interface Spec extends TurboModule {
@@ -337,7 +342,8 @@ export interface Spec extends TurboModule {
   pause(): Promise<void>;
   stop(): Promise<void>;
   reset(): Promise<void>;
-  seekTo(position: number): Promise<void>;
+  /** `restore` as for {@link Spec.loadQueue}. */
+  seekTo(position: number, restore: boolean): Promise<void>;
 
   /**
    * Replace the queue, the index and the position in one call, then apply the intent.
@@ -348,8 +354,19 @@ export interface Spec extends TurboModule {
    * position is part of the load: no event can report 0 before the target.
    *
    * `startPositionSec <= 0` means "from the beginning".
+   *
+   * `restore: true` says the position was restored from storage rather than chosen by the listener:
+   * the app's native start-position advisor, when one is registered, is asked where to start first.
+   * Required, not optional: an optional argument JS leaves out shifts the promise callbacks into its
+   * slot on iOS, and the module then reads a block as the flag.
    */
-  loadQueue(tracks: Array<Track>, startIndex: Int32, startPositionSec: Double, playWhenReady: boolean): Promise<void>;
+  loadQueue(
+    tracks: Array<Track>,
+    startIndex: Int32,
+    startPositionSec: Double,
+    playWhenReady: boolean,
+    restore: boolean
+  ): Promise<void>;
 
   /**
    * Arm a pending stop: when playback reaches `positionSec` in the current track, the engine pauses
@@ -382,7 +399,8 @@ export interface Spec extends TurboModule {
   // Navigation
   skipToNext(): Promise<void>;
   skipToPrevious(): Promise<void>;
-  skip(index: Int32, initialPosition?: Int32): Promise<void>;
+  /** `initialPosition` in seconds, < 0 for the item's start; `restore` as for {@link Spec.loadQueue}. */
+  skip(index: Int32, initialPosition: Double, restore: boolean): Promise<void>;
   skipToTrack(index: Int32): Promise<void>;
   removeUpcomingTracks(): Promise<void>;
   
