@@ -203,8 +203,10 @@ public final class PlayerCore: NSObject {
 
     /// The armed stop: where, and the source of the item it was armed on. Written on the module
     /// queue and read by the poll on main, so only under `stopAtLock`.
-    private var stopAtTarget: (position: Double, itemURL: URL?)?
+    private var stopAtTarget: (position: Double, itemURL: URL?, id: Int)?
     private let stopAtLock = NSLock()
+    /// Numbers each ``setStopAt(_:)``, so a check that read one stop never takes a later one.
+    private var stopAtCount = 0
     /// The poll. Created and invalidated on main only: a `Timer` must be invalidated on the thread
     /// whose run loop it was added to.
     private var stopAtTimer: Timer?
@@ -595,7 +597,8 @@ public final class PlayerCore: NSObject {
         guard position.isFinite else { return }
         let itemURL = player.currentItem.flatMap(Self.sourceURL(of:))
         stopAtLock.lock()
-        stopAtTarget = (position, itemURL)
+        stopAtCount += 1
+        stopAtTarget = (position, itemURL, stopAtCount)
         stopAtLock.unlock()
         onMain { [weak self] in
             guard let self = self else { return }
@@ -619,11 +622,16 @@ public final class PlayerCore: NSObject {
         }
     }
 
-    /// The armed stop, disarmed in the same step: whoever takes it is the one that honours it.
-    private func takeStopAt() -> (position: Double, itemURL: URL?)? {
+    /// The armed stop, disarmed in the same locked step as the test, so the poll and the item-end
+    /// handler cannot both honour it, nor one of them miss it because the other cleared it in
+    /// between: `id` takes only the stop that was read, `itemURL` only the one armed on that item.
+    private func takeStopAt(id: Int? = nil, itemURL: URL? = nil) -> (position: Double, itemURL: URL?, id: Int)? {
         stopAtLock.lock()
         defer { stopAtLock.unlock() }
-        let armed = stopAtTarget
+        guard let armed = stopAtTarget,
+              id.map({ $0 == armed.id }) ?? true,
+              itemURL.map({ $0 == armed.itemURL }) ?? true
+        else { return nil }
         stopAtTarget = nil
         return armed
     }
@@ -645,7 +653,7 @@ public final class PlayerCore: NSObject {
         // A seek or a load still landing: `position` is its target, not where the voice is.
         guard pendingPosition == nil else { return }
         let now = position
-        guard now >= armed.position - 0.05, takeStopAt() != nil else { return }
+        guard now >= armed.position - 0.05, takeStopAt(id: armed.id) != nil else { return }
         clearStopAt()
         honourStopAt(at: now)
     }
@@ -687,17 +695,15 @@ public final class PlayerCore: NSObject {
         let trackId = (ended.item as? Track)?.toObject()["id"] as? String
         // A stop armed on this item that the poll had not reached yet (it sat within a poll of the
         // end): the item's end is where it stops, and the next item must not play.
-        stopAtLock.lock()
-        let stopOnThisItem = stopAtTarget.map { $0.itemURL == url.standardized } ?? false
-        stopAtLock.unlock()
-        if stopOnThisItem, let armed = takeStopAt() {
+        let stopOnThisItem = takeStopAt(itemURL: url.standardized)
+        if let armed = stopOnThisItem {
             clearStopAt()
             player.playWhenReady = false
             honourStopAt(at: armed.position)
         }
         // Android arms media3's pause only while a next item exists: the last item's end stays the
         // queue's end on both platforms.
-        let paused = !stopOnThisItem && pauseAtEndOfItem && ended.hasNext
+        let paused = stopOnThisItem == nil && pauseAtEndOfItem && ended.hasNext
         if paused {
             player.playWhenReady = false
             publishSnapshot(reason: .system)
