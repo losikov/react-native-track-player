@@ -14,6 +14,7 @@ import android.support.v4.media.RatingCompat
 import androidx.annotation.MainThread
 import androidx.media3.common.MediaItem
 import androidx.media3.common.MediaMetadata
+import androidx.media3.common.PlaybackException
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.session.CommandButton
 import androidx.media3.session.LibraryResult
@@ -541,6 +542,8 @@ class MusicService : HeadlessJsMediaService() {
 
     @MainThread
     override fun onDestroy() {
+        playbackErrorHandler.removeCallbacks(clearPlaybackErrorRunnable)
+        playbackErrorShown = false
         librarySession?.release()
         librarySession = null
         sessionPlayer = null
@@ -569,6 +572,7 @@ class MusicService : HeadlessJsMediaService() {
     private val mediaSessionCallback = object : AAMediaSessionCallBack {
         override fun handlePlayFromMediaId(mediaId: String?, extras: Bundle?) {
             Timber.tag("GVA-RNTP").d("RNTP received req to play from mediaID: $mediaId")
+            clearPlaybackStateError()
             if (mediaId.isNullOrEmpty()) {
                 setPlaybackStateError(
                     android.support.v4.media.session.PlaybackStateCompat.ERROR_CODE_APP_ERROR,
@@ -583,6 +587,7 @@ class MusicService : HeadlessJsMediaService() {
 
         override fun handlePlayFromSearch(query: String?, extras: Bundle?) {
             Timber.tag("GVA-RNTP").d("RNTP received req to play from query: $query, extras: $extras")
+            clearPlaybackStateError()
 
             val searchQuery = query ?: ""
             val artistName = extras?.getString("android.intent.extra.artist")
@@ -628,6 +633,7 @@ class MusicService : HeadlessJsMediaService() {
 
         override fun handlePrepareFromMediaId(mediaId: String?, extras: Bundle?) {
             Timber.tag("GVA-RNTP").d("RNTP received req to prepare from mediaID: $mediaId")
+            clearPlaybackStateError()
             if (mediaId.isNullOrEmpty()) {
                 setPlaybackStateError(
                     android.support.v4.media.session.PlaybackStateCompat.ERROR_CODE_APP_ERROR,
@@ -643,6 +649,7 @@ class MusicService : HeadlessJsMediaService() {
 
         override fun handlePrepareFromSearch(query: String?, extras: Bundle?) {
             Timber.tag("GVA-RNTP").d("RNTP received req to prepare from query: $query, extras: $extras")
+            clearPlaybackStateError()
             val searchBundle = Bundle().apply {
                 putString("query", query ?: "")
                 putBoolean("playWhenReady", false)
@@ -1143,11 +1150,23 @@ class MusicService : HeadlessJsMediaService() {
     }
 
     /**
-     * PlaybackState error for Google Assistant.
+     * PlaybackState error for Google Assistant and Android Auto: a request JS could not serve
+     * (a voice "play X" for a book that is not there).
      *
-     * JS speaks `PlaybackStateCompat` error codes; media3 speaks [SessionError] codes and converts
-     * them back for legacy controllers. [sessionErrorCodeFor] is that conversion run backwards, so
-     * the code Assistant sees is the code JS asked for.
+     * JS speaks `PlaybackStateCompat` error codes; media3 converts its own codes back for legacy
+     * controllers. [sessionErrorCodeFor] is that conversion run backwards, so the code Assistant
+     * sees is the code JS asked for.
+     *
+     * This must be [MediaSession.setPlaybackException], not `sendError`: a `sendError` is non-fatal,
+     * and the platform session never showed it — `dumpsys media_session` kept `error=null` on a
+     * Pixel 4a with Android Auto connected (#250). The playback exception is what legacy
+     * controllers read as `STATE_ERROR` with the code and message. While it stands, the published
+     * legacy actions shrink to almost none (no pause, no play-from-id) even if a book is still
+     * playing, so it is lifted on the next load, play or skip from JS, on any remote command or
+     * play/prepare request, and after [PLAYBACK_ERROR_SHOWN_MS] at the latest — long enough for
+     * Assistant to read the state change, short enough not to strand the car's controls. A media
+     * key pressed inside that window is dropped by media3 (seen on the Pixel 4a: a pause during the
+     * error never arrived), so the cap is what bounds it.
      */
     fun setPlaybackStateError(errorCode: Int, errorMessage: String) {
         val session = librarySession
@@ -1157,7 +1176,22 @@ class MusicService : HeadlessJsMediaService() {
         }
         val sessionErrorCode = sessionErrorCodeFor(errorCode)
         Timber.tag("GVA-RNTP").d("setPlaybackStateError: legacy=%d -> session=%d, %s", errorCode, sessionErrorCode, errorMessage)
-        session.sendError(SessionError(sessionErrorCode, errorMessage))
+        session.setPlaybackException(PlaybackException(errorMessage, null, sessionErrorCode))
+        playbackErrorShown = true
+        playbackErrorHandler.removeCallbacks(clearPlaybackErrorRunnable)
+        playbackErrorHandler.postDelayed(clearPlaybackErrorRunnable, PLAYBACK_ERROR_SHOWN_MS)
+    }
+
+    private var playbackErrorShown = false
+    private val playbackErrorHandler = android.os.Handler(android.os.Looper.getMainLooper())
+    private val clearPlaybackErrorRunnable = Runnable { clearPlaybackStateError() }
+
+    /** Lifts [setPlaybackStateError]'s error, so controllers see the player's own state again. */
+    private fun clearPlaybackStateError() {
+        playbackErrorHandler.removeCallbacks(clearPlaybackErrorRunnable)
+        if (!playbackErrorShown) return
+        playbackErrorShown = false
+        librarySession?.setPlaybackException(null)
     }
 
     // endregion
@@ -1273,6 +1307,7 @@ class MusicService : HeadlessJsMediaService() {
 
     @MainThread
     fun load(track: Track) {
+        clearPlaybackStateError()
         player.load(track.toAudioItem())
     }
 
@@ -1293,6 +1328,7 @@ class MusicService : HeadlessJsMediaService() {
         val positionMs =
             if (startPositionSeconds > 0) (startPositionSeconds * 1000).toLong()
             else androidx.media3.common.C.TIME_UNSET
+        clearPlaybackStateError()
         player.loadQueue(tracks.map { it.toAudioItem() }, startIndex, positionMs, playWhenReady, restore)
     }
 
@@ -1343,6 +1379,7 @@ class MusicService : HeadlessJsMediaService() {
 
     @MainThread
     fun play() {
+        clearPlaybackStateError()
         player.play()
     }
 
@@ -1385,6 +1422,7 @@ class MusicService : HeadlessJsMediaService() {
             }
         // Single seekTo(index, positionMs) — do not seek again after jumpToItem; ExoPlayer drops
         // a follow-up seek when prepare() is still running (iOS seekTo-after-jump works synchronously).
+        clearPlaybackStateError()
         player.jumpToItem(index, positionMs, restore)
     }
 
@@ -1595,6 +1633,9 @@ class MusicService : HeadlessJsMediaService() {
     // region events
 
     private fun handleRemoteAction(action: MediaSessionCallback) {
+        // A remote transport command is applied natively and never reaches MusicService.play(), so
+        // it lifts a standing setPlaybackStateError here.
+        clearPlaybackStateError()
         when (action) {
             is MediaSessionCallback.RATING -> {
                 // BUTTON_SET_RATING is not in the TurboModule spec - skipping
@@ -1783,6 +1824,9 @@ class MusicService : HeadlessJsMediaService() {
     }
 
     companion object {
+        /** How long [setPlaybackStateError]'s error stands if nothing loads or plays first. */
+        const val PLAYBACK_ERROR_SHOWN_MS = 3_000L
+
         const val STATE_KEY = "state"
         const val ERROR_KEY = "error"
         const val EVENT_KEY = "event"
@@ -1902,10 +1946,10 @@ class MusicService : HeadlessJsMediaService() {
          * `LegacyConversions.convertToLegacyErrorCode` run backwards.
          *
          * JS passes `PlaybackStateCompat` error codes (the app passes `1`, `ERROR_CODE_APP_ERROR`).
-         * media3 only accepts its own [SessionError] codes and maps them back for legacy
-         * controllers, so this picks the [SessionError] code whose legacy image is the one asked
-         * for; anything unmapped becomes `ERROR_UNKNOWN`, whose legacy image is
-         * `ERROR_CODE_UNKNOWN_ERROR`.
+         * media3 maps its own codes back for legacy controllers — [SessionError] codes and the
+         * `PlaybackException` codes [setPlaybackStateError] passes share the numbering — so this
+         * picks the code whose legacy image is the one asked for; anything unmapped becomes
+         * `ERROR_UNKNOWN`, whose legacy image is `ERROR_CODE_UNKNOWN_ERROR`.
          */
         internal fun sessionErrorCodeFor(playbackStateCompatErrorCode: Int): Int =
             when (playbackStateCompatErrorCode) {
