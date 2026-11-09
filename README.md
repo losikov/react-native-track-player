@@ -1,3 +1,22 @@
+# About this fork
+
+A fork of `react-native-track-player` 4.1.1, kept for the owner's own apps. It adds Android Auto, Google Assistant and New Architecture support, plus a Media3 engine on Android.
+
+**Main changes**
+- **Android engine:** AndroidX Media3 1.11.0 (`MediaLibraryService`, `MediaSession`, default notification) replaces ExoPlayer 2.19.1, `MediaSessionConnector` and the custom notification; KotlinAudio folded in.
+- **Android Auto / Assistant:** browse tree, search and play-from-search, voice search, PREPARE actions, suggested items, artwork via a content provider, `MediaType`, `setSessionActivity`, `setPlaybackStateError` (reported as `STATE_ERROR`); Android 12+ foreground-service limits handled.
+- **Both platforms:** Turbo Modules, a shared PlayerCore state model with native-first transport, atomic queue load and `jumpToItem` with a position, clean detach on JS reload, exact seeking in constant-bitrate MP3s; native app code can follow playback without a React hop.
+- **Playback extras:** start-position advisor and restore flag, pause after a long focus loss, sleep-timer hooks, remote speed control (iOS rate command, CarPlay and Android buttons).
+- **iOS:** Now Playing via `MPNowPlayingInfoCenter`, CarPlay play/pause and stop-at fixes.
+
+**Branch:** `dev-android-auto-turbo-media3` (the default); `dev-android-auto` and `dev-android-auto-turbo` predate Media3. Install from git: `"react-native-track-player": "github:losikov/react-native-track-player#dev-android-auto-turbo-media3"` (React ≥ 19.1, RN ≥ 0.81.4, New Architecture). [rntp.dev](https://rntp.dev) still covers most of the public API; behaviour and the extras above differ.
+
+**Support:** maintained for the owner's own use; not on npm; no support, and issues or PRs may go unanswered. Use upstream for anything else.
+
+Forked from [doublesymmetry/react-native-track-player](https://github.com/doublesymmetry/react-native-track-player); the files are modified and remain under upstream's Apache 2.0 licence.
+
+---
+
 <img src="https:/rntp.dev/img/optimized-logo.svg" width="300" />
 
 [![downloads](https://img.shields.io/npm/dw/react-native-track-player.svg)](https://www.npmjs.com/package/react-native-track-player)
