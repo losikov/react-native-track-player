@@ -234,9 +234,16 @@ class MusicService : HeadlessJsMediaService() {
 
     private val pendingSearchRequests = mutableListOf<PendingSearchRequest>()
 
-    /** `onGetChildren` for a node the tree does not have yet: resolved by `setBrowseTree`. */
-    private val pendingBrowseResults =
-        mutableMapOf<String, SettableFuture<LibraryResult<ImmutableList<MediaItem>>>>()
+    /**
+     * `onGetChildren` for a node the tree does not have yet: resolved by `setBrowseTree`. Keeps the
+     * package of every browser that asked, so the `onRemoteBrowse` sent when it resolves can say who.
+     */
+    private class PendingBrowse(
+        val future: SettableFuture<LibraryResult<ImmutableList<MediaItem>>>,
+        val packages: MutableSet<String> = linkedSetOf(),
+    )
+
+    private val pendingBrowseResults = mutableMapOf<String, PendingBrowse>()
     private var isInitializingReactNative = false
 
     override fun onCreate() {
@@ -555,7 +562,7 @@ class MusicService : HeadlessJsMediaService() {
         eventJobs.clear()
 
         // Unblock any browser still waiting on a node the tree never delivered.
-        pendingBrowseResults.values.forEach { it.set(LibraryResult.ofItemList(emptyList(), null)) }
+        pendingBrowseResults.values.forEach { it.future.set(LibraryResult.ofItemList(emptyList(), null)) }
         pendingBrowseResults.clear()
         pendingSearchResults.clear()
         pendingSearchRequests.clear()
@@ -793,12 +800,18 @@ class MusicService : HeadlessJsMediaService() {
             if (trackPlayerModule == null || !keyExists) {
                 // getOrPut, not put: two browsers asking for the same node before the tree exists
                 // share one future, so neither is left holding one that is never completed.
-                val future = pendingBrowseResults.getOrPut(parentId) { SettableFuture.create() }
+                val pending = pendingBrowseResults.getOrPut(parentId) { PendingBrowse(SettableFuture.create()) }
+                pending.packages.add(browser.packageName)
                 startReactNativeIfNeeded()
-                return future
+                return pending.future
             }
 
-            trackPlayerModule?.onRemoteBrowse(Bundle().apply { putString("mediaId", parentId) })
+            // The requester's package rides along: JS counts a car connect only for Android Auto,
+            // and a Wear, Assistant or Bluetooth browser reaches this path too.
+            trackPlayerModule?.onRemoteBrowse(Bundle().apply {
+                putString("mediaId", parentId)
+                putString("packageName", browser.packageName)
+            })
             return Futures.immediateFuture(
                 LibraryResult.ofItemList(mediaTree[parentId] ?: emptyList(), params)
             )
@@ -985,11 +998,18 @@ class MusicService : HeadlessJsMediaService() {
         }
 
         Timber.tag("RNTP-AA").d("Sending ${ready.size} pending browse results")
-        ready.forEach { (parentMediaId, future) ->
+        ready.forEach { (parentMediaId, pending) ->
             pendingBrowseResults.remove(parentMediaId)
             val content = mediaTree[parentMediaId] ?: emptyList()
-            trackPlayerModule?.onRemoteBrowse(Bundle().apply { putString("mediaId", parentMediaId) })
-            future.set(LibraryResult.ofItemList(content, null))
+            // One event per node, however many browsers waited on it: Android Auto if it was one of
+            // them, otherwise the first to ask.
+            val requester = pending.packages.firstOrNull { it == ANDROID_AUTO_PACKAGE }
+                ?: pending.packages.firstOrNull()
+            trackPlayerModule?.onRemoteBrowse(Bundle().apply {
+                putString("mediaId", parentMediaId)
+                if (requester != null) putString("packageName", requester)
+            })
+            pending.future.set(LibraryResult.ofItemList(content, null))
         }
     }
 

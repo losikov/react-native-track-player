@@ -468,7 +468,11 @@ export interface Spec extends TurboModule {
    */
   readonly onRemoteSetRate: EventEmitter<{ rate: Double }>;
   readonly onRemotePlayId: EventEmitter<{ id: string }>;
-  readonly onRemoteBrowse: EventEmitter<{ mediaId: string }>;
+  /**
+   * A media browser asked for a node's children. `packageName` is the requesting app (Android
+   * Auto is `com.google.android.projection.gearhead`); absent from older native builds.
+   */
+  readonly onRemoteBrowse: EventEmitter<{ mediaId: string; packageName?: string }>;
   
   /**
    * Triggered when user issues voice commands like "Play [song name]" or "Play [artist name]"
